@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: .
+    container_name: rabar-backend
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+    restart: unless-stopped
+    # depends_on:
+    #   - redis
+
+  # Uncomment to enable distributed rate limiting in the future.
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: rabar-redis
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped

@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# Overpass disk cache
+.cache/
+
+# local agent/tool state
+.claude-flow/
+.claude/
+.remember/

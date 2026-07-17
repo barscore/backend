@@ -1,0 +1,20 @@
+{
+  "name": "rabar-backend",
+  "version": "1.0.0",
+  "description": "rabar API — Hono.js backend",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@supabase/supabase-js": "^2.47.10",
+    "dotenv": "^16.4.7",
+    "hono": "^4.6.14",
+    "stripe": "^22.3.1",
+    "web-push": "^3.6.7",
+    "zod": "^3.24.1"
+  }
+}
