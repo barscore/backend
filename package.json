@@ -1,7 +1,7 @@
 {
   "name": "rabar-backend",
   "version": "1.0.0",
-  "description": "rabar API — Hono.js backend",
+  "description": "rabar API \u2014 Hono.js backend",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -9,6 +9,7 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@apple/app-store-server-library": "^3.1.0",
     "@hono/node-server": "^1.13.7",
     "@supabase/supabase-js": "^2.47.10",
     "dotenv": "^16.4.7",

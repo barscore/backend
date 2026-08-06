@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import Stripe from 'stripe';
 import { supabase } from '../lib/supabase.js';
-import { TIERS } from './boosts.js';
+import { applyBoost } from '../lib/boostFulfillment.js';
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
@@ -35,23 +35,7 @@ hook.post('/webhook', async (c) => {
         .select('event_id, bar_id, tier')
         .maybeSingle();
 
-      if (order) {
-        // Stack purchases: extend from the current boost end when still active.
-        const days = TIERS[order.tier].days;
-        const table = order.event_id ? 'events' : 'bars';
-        const targetId = order.event_id ?? order.bar_id;
-        const { data: row } = await supabase
-          .from(table)
-          .select('boost_until')
-          .eq('id', targetId)
-          .maybeSingle();
-        const base =
-          row?.boost_until && new Date(row.boost_until) > new Date()
-            ? new Date(row.boost_until)
-            : new Date();
-        const until = new Date(base.getTime() + days * 86_400_000).toISOString();
-        await supabase.from(table).update({ boost_until: until }).eq('id', targetId);
-      }
+      if (order) await applyBoost(order);
     }
   }
   return c.json({ received: true });

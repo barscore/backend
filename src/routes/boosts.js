@@ -3,18 +3,18 @@ import Stripe from 'stripe';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
-import { boostCheckoutSchema } from '../schemas/boostSchemas.js';
+import { uuidParam } from '../schemas/common.js';
+import { TIERS, applyBoost, assertOwnsTarget } from '../lib/boostFulfillment.js';
+import { verifySignedTransaction } from '../lib/appleIap.js';
+import { appleOrderSchema, appleVerifySchema, boostCheckoutSchema } from '../schemas/boostSchemas.js';
 
 // Paid visibility boosts. Prices are server-side only (env), the client sends
 // just tier + target. Inline price_data ⇒ no products to manage in the Stripe
-// dashboard. Fulfillment happens in the signed webhook, never here.
+// dashboard. Fulfillment happens in the signed webhook / the Apple verification
+// endpoint, never in the request that starts the payment.
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
-export const TIERS = {
-  '3d': { days: 3, amount_cents: Number(process.env.BOOST_PRICE_3D_CENTS) || 300 },
-  '7d': { days: 7, amount_cents: Number(process.env.BOOST_PRICE_7D_CENTS) || 600 },
-  '30d': { days: 30, amount_cents: Number(process.env.BOOST_PRICE_30D_CENTS) || 2000 },
-};
+export { TIERS };
 
 const boosts = new Hono();
 
@@ -45,28 +45,7 @@ boosts.post('/checkout', requireAuth, requireRole('organizer'), async (c) => {
   const t = TIERS[tier];
 
   // Ownership gate: own events / own (claimed) bar only.
-  let label;
-  if (event_id) {
-    const { data: ev } = await supabase
-      .from('events')
-      .select('id, title, created_by, cancelled_at, starts_at, ends_at')
-      .eq('id', event_id)
-      .maybeSingle();
-    if (!ev || ev.created_by !== user.id) throw new AppError(404, 'NOT_FOUND', 'Evento non trovato');
-    if (ev.cancelled_at) throw new AppError(400, 'VALIDATION_ERROR', 'Evento annullato');
-    if (new Date(ev.ends_at ?? ev.starts_at) < new Date()) {
-      throw new AppError(400, 'VALIDATION_ERROR', 'Evento già concluso');
-    }
-    label = `Boost evento "${ev.title}" — ${t.days} giorni`;
-  } else {
-    const { data: bar } = await supabase
-      .from('bars')
-      .select('id, name, owner_id')
-      .eq('id', bar_id)
-      .maybeSingle();
-    if (!bar || bar.owner_id !== user.id) throw new AppError(404, 'NOT_FOUND', 'Bar non trovato');
-    label = `Boost bar "${bar.name}" — ${t.days} giorni`;
-  }
+  const label = await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
 
   const { data: order, error } = await supabase
     .from('boost_orders')
@@ -101,6 +80,132 @@ boosts.post('/checkout', requireAuth, requireRole('organizer'), async (c) => {
 
   await supabase.from('boost_orders').update({ stripe_session_id: session.id }).eq('id', order.id);
   return c.json({ url: session.url });
+});
+
+// ---------------------------------------------------------------------------
+// Apple in-app purchases (iOS client)
+//
+// App Store rule 3.1.1 rules out sending people to Stripe for something used
+// inside the app, so iOS buys the same boost as a consumable IAP. The order is
+// opened here first — that is where the ownership gate runs, before the user is
+// charged — and the id travels back as the transaction's appAccountToken.
+// ---------------------------------------------------------------------------
+
+/** Product ids, mirroring `Config.boostProductIDs` in the iOS app. */
+const APPLE_PRODUCTS = {
+  '3d': 'com.rabar.app.boost.3d',
+  '7d': 'com.rabar.app.boost.7d',
+  '30d': 'com.rabar.app.boost.30d',
+};
+
+/** POST /boosts/apple/order — open a pending order for an IAP. */
+boosts.post('/apple/order', requireAuth, requireRole('organizer'), async (c) => {
+  const user = c.get('user');
+  const { tier, event_id, bar_id } = appleOrderSchema.parse(await c.req.json());
+  const t = TIERS[tier];
+
+  await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
+
+  const { data: order, error } = await supabase
+    .from('boost_orders')
+    .insert({
+      user_id: user.id,
+      event_id: event_id ?? null,
+      bar_id: bar_id ?? null,
+      tier,
+      amount_cents: t.amount_cents,
+      provider: 'apple',
+    })
+    .select('id')
+    .single();
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Creazione ordine non riuscita');
+
+  return c.json({ order_id: order.id, product_id: APPLE_PRODUCTS[tier] });
+});
+
+/**
+ * POST /boosts/apple/verify — verify a signed StoreKit transaction and fulfil.
+ *
+ * Idempotent in two layers: the pending→paid update filters on status, and
+ * `apple_transaction_id` is uniquely indexed. Replaying a transaction (Apple
+ * retries, `Transaction.updates` on a second device) therefore lands on an
+ * already-paid row and returns it unchanged rather than granting a second boost.
+ */
+boosts.post('/apple/verify', requireAuth, async (c) => {
+  const user = c.get('user');
+  const { signed_transaction } = appleVerifySchema.parse(await c.req.json());
+
+  const payload = await verifySignedTransaction(signed_transaction);
+  if (!payload) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Transazione Apple non verificabile');
+  }
+
+  const transactionId = payload.transactionId;
+  const orderId = payload.appAccountToken;
+  if (!transactionId || !orderId) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Transazione senza ordine associato');
+  }
+
+  // Already recorded: hand back the same order instead of paying it twice.
+  const { data: seen } = await supabase
+    .from('boost_orders')
+    .select('id, status, tier, event_id, bar_id, paid_at')
+    .eq('apple_transaction_id', transactionId)
+    .maybeSingle();
+  if (seen) return c.json({ order: seen });
+
+  const { data: order } = await supabase
+    .from('boost_orders')
+    .select('id, user_id, tier, event_id, bar_id, status')
+    .eq('id', orderId)
+    .maybeSingle();
+  if (!order || order.user_id !== user.id) {
+    throw new AppError(404, 'NOT_FOUND', 'Ordine non trovato');
+  }
+
+  // The product actually bought has to match the tier the order was opened
+  // for, or a 3-day purchase could be redeemed against a 30-day order.
+  if (payload.productId && payload.productId !== APPLE_PRODUCTS[order.tier]) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Prodotto non corrispondente all’ordine');
+  }
+
+  const { data: paid } = await supabase
+    .from('boost_orders')
+    .update({
+      status: 'paid',
+      paid_at: new Date().toISOString(),
+      apple_transaction_id: transactionId,
+    })
+    .eq('id', order.id)
+    .eq('status', 'pending')
+    .select('id, status, tier, event_id, bar_id, paid_at')
+    .maybeSingle();
+
+  // Lost the race against a concurrent verification of the same order.
+  if (!paid) {
+    const { data: current } = await supabase
+      .from('boost_orders')
+      .select('id, status, tier, event_id, bar_id, paid_at')
+      .eq('id', order.id)
+      .maybeSingle();
+    return c.json({ order: current });
+  }
+
+  await applyBoost(paid);
+  return c.json({ order: paid });
+});
+
+/** GET /boosts/order/:id — order status for the purchase result screen. */
+boosts.get('/order/:id', requireAuth, async (c) => {
+  const { data, error } = await supabase
+    .from('boost_orders')
+    .select('id, status, tier, event_id, bar_id, paid_at')
+    .eq('id', uuidParam(c))
+    .eq('user_id', c.get('user').id)
+    .maybeSingle();
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load order');
+  if (!data) throw new AppError(404, 'NOT_FOUND', 'Ordine non trovato');
+  return c.json({ order: data });
 });
 
 export default boosts;
