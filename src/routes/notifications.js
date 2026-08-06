@@ -6,6 +6,7 @@ import {
   listNotificationsQuerySchema,
   markReadSchema,
 } from '../schemas/notificationSchemas.js';
+import { uuidParam } from '../schemas/common.js';
 
 // In-app notification inbox. Rows are created by lib/notify.js fan-outs.
 const notifications = new Hono();
@@ -50,6 +51,21 @@ notifications.post('/read', async (c) => {
   if ('ids' in body) query = query.in('id', body.ids);
   const { error } = await query;
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update notifications');
+  return c.json({ success: true });
+});
+
+/** DELETE /notifications/:id — drop one row from the caller's inbox. */
+notifications.delete('/:id', async (c) => {
+  const user = c.get('user');
+  const id = uuidParam(c);
+
+  const { error } = await supabase
+    .from('notifications')
+    .delete()
+    .eq('user_id', user.id)
+    .eq('id', id);
+
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete notification');
   return c.json({ success: true });
 });
 
