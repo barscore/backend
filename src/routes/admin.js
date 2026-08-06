@@ -57,7 +57,7 @@ admin.get('/stats', async (c) => {
 
 /** GET /admin/users — paginated user list with moderation state + rating count. */
 admin.get('/users', async (c) => {
-  const { q, role, page, limit } = listUsersQuerySchema.parse(
+  const { q, role, banned, suspended, page, limit } = listUsersQuerySchema.parse(
     Object.fromEntries(new URL(c.req.url).searchParams),
   );
   const from = (page - 1) * limit;
@@ -73,6 +73,15 @@ admin.get('/users', async (c) => {
     .range(from, to);
 
   if (role) query = query.eq('role', role);
+  if (banned !== undefined) query = query.eq('banned', banned);
+  // "Suspended" is a live comparison, not a column: a lapsed suspension is not
+  // one, and a ban clears suspended_until.
+  if (suspended !== undefined) {
+    const nowIso = new Date().toISOString();
+    query = suspended
+      ? query.gt('suspended_until', nowIso)
+      : query.or(`suspended_until.is.null,suspended_until.lte.${nowIso}`);
+  }
   // Strip PostgREST .or() metacharacters — a "," or ")" in q would otherwise be
   // parsed as extra filter conditions (filter injection).
   if (q) {

@@ -1,9 +1,19 @@
 import { z } from 'zod';
 
+// Query-string booleans: only the literal 'true'/'false' pass, because
+// z.coerce.boolean() would read the string 'false' as true.
+const boolParam = z
+  .enum(['true', 'false'])
+  .transform((v) => v === 'true')
+  .optional();
+
 // --- Users ---------------------------------------------------------------
 export const listUsersQuerySchema = z.object({
   q: z.string().trim().max(100).optional(),
   role: z.enum(['user', 'betatester', 'moderator', 'admin', 'organizer']).optional(),
+  // Moderation filters; sent only when the staff UI has one switched on.
+  banned: boolParam,
+  suspended: boolParam,
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
