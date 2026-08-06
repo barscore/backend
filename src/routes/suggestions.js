@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole, optionalUser } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { rateLimiter } from '../middleware/rateLimiter.js';
+import { notify } from '../lib/notify.js';
 import {
   createSuggestionSchema,
   listSuggestionsQuerySchema,
@@ -81,11 +82,24 @@ suggestions.patch('/:id', async (c) => {
     .from('bar_suggestions')
     .update({ status, updated_at: new Date().toISOString() })
     .eq('id', id)
-    .select('id, status')
+    .select('id, status, name, created_by')
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update suggestion');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Segnalazione non trovata');
-  return c.json({ suggestion: data });
+
+  // The lead can be submitted signed out, in which case there is nobody to
+  // tell — notify() drops the empty id.
+  if (status === 'done' || status === 'rejected') {
+    await notify([data.created_by], {
+      type: status === 'done' ? 'request_approved' : 'request_rejected',
+      title: status === 'done' ? 'Segnalazione accettata' : 'Segnalazione non accettata',
+      body:
+        status === 'done'
+          ? `"${data.name}" è stato aggiunto a rabar. Grazie per la segnalazione!`
+          : `La segnalazione per "${data.name}" non è stata accettata.`,
+    });
+  }
+  return c.json({ suggestion: { id: data.id, status: data.status } });
 });
 
 /** DELETE /suggestions/:id — drop a handled/spam suggestion. */

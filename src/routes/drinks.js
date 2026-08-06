@@ -5,6 +5,7 @@ import { requireAuth, requireRole, optionalUser } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { rateLimiter } from '../middleware/rateLimiter.js';
 import { assertRatingsEnabled } from './ratings.js';
+import { notify } from '../lib/notify.js';
 import {
   listDrinksQuerySchema,
   listTopQuerySchema,
@@ -119,6 +120,20 @@ suggestions.patch('/:id', async (c) => {
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update suggestion');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Proposta non trovata');
+
+  if (status === 'done' || status === 'rejected') {
+    await notify([sugg.created_by], {
+      type: status === 'done' ? 'request_approved' : 'request_rejected',
+      title: status === 'done' ? 'Drink approvato' : 'Proposta non accettata',
+      body:
+        status === 'done'
+          ? `"${sugg.name}" è entrato nel catalogo drink. Grazie!`
+          : `La tua proposta "${sugg.name}" non è stata accettata.`,
+      // Only when the insert actually created the row: on a duplicate name
+      // there is no id to point at.
+      link: drink?.id ? `/drink/${drink.id}` : null,
+    });
+  }
   return c.json({ suggestion: data, drink });
 });
 
