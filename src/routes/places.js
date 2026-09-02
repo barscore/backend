@@ -21,7 +21,13 @@ const places = new Hono();
 const NEARBY_TTL_MS = Number(process.env.NEARBY_CACHE_TTL_MS) || 30 * 60 * 1000; // fresh window
 const NEARBY_MAX_AGE_MS = Number(process.env.NEARBY_CACHE_MAX_AGE_MS) || 7 * 24 * 60 * 60 * 1000; // serve-stale window
 const NEARBY_CACHE_MAX = 2000;
-const CACHE_FILE = resolve(process.env.NEARBY_CACHE_FILE || './.cache/nearby.json');
+// On Vercel the bundle filesystem is read-only — only /tmp is writable (and it
+// survives between requests on the same warm instance, which is what this cache
+// wants). Locally it stays next to the repo so `--watch` reloads keep it.
+const CACHE_FILE = resolve(
+  process.env.NEARBY_CACHE_FILE ||
+    (process.env.VERCEL ? '/tmp/rabar-nearby.json' : './.cache/nearby.json'),
+);
 
 const nearbyCache = new Map(); // key -> { at, places }
 const inflight = new Map(); // key -> Promise (dedupe concurrent upstream fetches)

@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import Stripe from 'stripe';
 import { supabase } from '../lib/supabase.js';
-import { TIERS } from './boosts.js';
+import { applyBoost } from '../lib/boostFulfillment.js';
+import { syncSubscription } from '../lib/plus.js';
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
@@ -9,6 +10,16 @@ const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SEC
 // signature check on the RAW body. Idempotent: the pending→paid transition
 // filters on status, so Stripe redeliveries no-op.
 const hook = new Hono();
+
+/**
+ * The subscription id on an invoice: top level until API 2025-03-31, then
+ * under `parent.subscription_details`. Both are read so bumping the API
+ * version can't silently stop renewals from being applied.
+ */
+function invoiceSubscriptionId(invoice) {
+  const sub = invoice?.subscription ?? invoice?.parent?.subscription_details?.subscription ?? null;
+  return typeof sub === 'string' ? sub : (sub?.id ?? null);
+}
 
 hook.post('/webhook', async (c) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return c.json({ received: true });
@@ -25,7 +36,19 @@ hook.post('/webhook', async (c) => {
   }
 
   if (event.type === 'checkout.session.completed') {
-    const orderId = event.data.object.metadata?.order_id;
+    const session = event.data.object;
+
+    // rabar+ — abbonamento: la sessione porta l'id utente nei metadata, il
+    // diritto lo scrive syncSubscription leggendo la subscription vera.
+    if (session.mode === 'subscription' && session.subscription) {
+      const sub = await stripe.subscriptions.retrieve(
+        typeof session.subscription === 'string' ? session.subscription : session.subscription.id,
+      );
+      await syncSubscription(sub, { userId: session.metadata?.user_id });
+    }
+
+    // Boost — pagamento una tantum.
+    const orderId = session.metadata?.order_id;
     if (orderId) {
       const { data: order } = await supabase
         .from('boost_orders')
@@ -35,25 +58,21 @@ hook.post('/webhook', async (c) => {
         .select('event_id, bar_id, tier')
         .maybeSingle();
 
-      if (order) {
-        // Stack purchases: extend from the current boost end when still active.
-        const days = TIERS[order.tier].days;
-        const table = order.event_id ? 'events' : 'bars';
-        const targetId = order.event_id ?? order.bar_id;
-        const { data: row } = await supabase
-          .from(table)
-          .select('boost_until')
-          .eq('id', targetId)
-          .maybeSingle();
-        const base =
-          row?.boost_until && new Date(row.boost_until) > new Date()
-            ? new Date(row.boost_until)
-            : new Date();
-        const until = new Date(base.getTime() + days * 86_400_000).toISOString();
-        await supabase.from(table).update({ boost_until: until }).eq('id', targetId);
-      }
+      if (order) await applyBoost(order);
     }
   }
+
+  // Rinnovo, cambio piano, disdetta, pagamento fallito: tutti finiscono nello
+  // stesso sync, che è l'unico a toccare profiles.plus_until.
+  if (event.type.startsWith('customer.subscription.')) {
+    await syncSubscription(event.data.object);
+  }
+
+  if (event.type === 'invoice.paid' || event.type === 'invoice.payment_failed') {
+    const subId = invoiceSubscriptionId(event.data.object);
+    if (subId) await syncSubscription(await stripe.subscriptions.retrieve(subId));
+  }
+
   return c.json({ received: true });
 });
 

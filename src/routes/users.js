@@ -2,12 +2,17 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { uuidParam } from '../schemas/common.js';
+import { isPlus } from '../lib/plus.js';
 
 // Public user profiles: the leaderboard/riconoscimenti profile popup and the
 // credits page. Only safe columns — never email or auth data.
 const users = new Hono();
 
-const PUBLIC_COLS = 'id, username, avatar_url, role, organizer_type, created_at';
+const PUBLIC_COLS =
+  'id, username, avatar_url, role, organizer_type, created_at, plus_until';
+
+/** Public shape: the rabar+ badge is public, the exact expiry is not. */
+const toPublic = (p) => ({ ...p, plus: isPlus(p), plus_until: undefined });
 const FOUNDER_USERNAME = 'mar7yyy';
 
 /** GET /users/credits — founder + admins + beta testers (Riconoscimenti page).
@@ -19,7 +24,7 @@ users.get('/credits', async (c) => {
     .or(`role.in.(admin,betatester),username.eq.${FOUNDER_USERNAME}`)
     .order('username', { ascending: true });
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load credits');
-  const all = data ?? [];
+  const all = (data ?? []).map(toPublic);
   const founder = all.find((p) => p.username === FOUNDER_USERNAME) ?? null;
   return c.json({
     founder,
@@ -49,7 +54,7 @@ users.get('/:id', async (c) => {
 
   return c.json({
     profile: {
-      ...profile,
+      ...toPublic(profile),
       ratings_count: ratingsCount,
       ice_cubes: ratingsCount * 10,
       is_founder: profile.username === FOUNDER_USERNAME,

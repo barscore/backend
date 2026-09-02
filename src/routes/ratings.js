@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { isPlus } from '../lib/plus.js';
 import {
   createRatingSchema,
   updateRatingSchema,
@@ -41,7 +42,7 @@ ratings.get('/', async (c) => {
 
   const { data, error, count } = await supabase
     .from('ratings')
-    .select('id, prezzo, qualita_drinks, socialita, varieta, orari, commento, created_at, profiles(username, avatar_url)', {
+    .select('id, prezzo, qualita_drinks, socialita, varieta, orari, commento, created_at, profiles(username, avatar_url, plus_until)', {
       count: 'exact',
     })
     .eq('bar_id', barId)
@@ -49,7 +50,14 @@ ratings.get('/', async (c) => {
     .range(from, to);
 
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load ratings');
-  return c.json({ ratings: data ?? [], page, limit, total: count ?? 0 });
+  // Derive the rabar+ badge here and drop the expiry: the review list is public.
+  const ratingsOut = (data ?? []).map((r) => ({
+    ...r,
+    profiles: r.profiles
+      ? { username: r.profiles.username, avatar_url: r.profiles.avatar_url, plus: isPlus(r.profiles) }
+      : null,
+  }));
+  return c.json({ ratings: ratingsOut, page, limit, total: count ?? 0 });
 });
 
 /** POST /bars/:id/ratings — create own rating (one per bar). */

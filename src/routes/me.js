@@ -3,6 +3,7 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { rateLimiter } from '../middleware/rateLimiter.js';
+import { isPlus } from '../lib/plus.js';
 import { myDrinkVotesQuerySchema } from '../schemas/drinkSchemas.js';
 import { createOrganizerRequestSchema } from '../schemas/organizerSchemas.js';
 
@@ -17,7 +18,7 @@ me.get('/', async (c) => {
 
   const { data: profile, error } = await supabase
     .from('profiles')
-    .select('id, username, avatar_url, created_at')
+    .select('id, username, avatar_url, created_at, plus_until')
     .eq('id', user.id)
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load profile');
@@ -37,6 +38,7 @@ me.get('/', async (c) => {
       email: user.email,
       ratings_count: ratingsCount,
       ice_cubes: ratingsCount * 10,
+      plus: isPlus(profile),
     },
   });
 });

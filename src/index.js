@@ -24,6 +24,7 @@ import organizerRoutes from './routes/organizers.js';
 import followRoutes from './routes/follows.js';
 import pushRoutes from './routes/push.js';
 import boostRoutes from './routes/boosts.js';
+import plusRoutes from './routes/plus.js';
 import stripeWebhookRoutes from './routes/stripeWebhook.js';
 import { startReminderWorker } from './lib/reminderWorker.js';
 
@@ -135,6 +136,7 @@ app.route('/admin/organizers', organizerRoutes);
 app.route('/follows', followRoutes);
 app.route('/push', pushRoutes);
 app.route('/boosts', boostRoutes);
+app.route('/plus', plusRoutes);
 app.route('/stripe', stripeWebhookRoutes);
 
 app.notFound((c) =>
