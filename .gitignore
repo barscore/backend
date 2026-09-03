@@ -12,3 +12,5 @@ node_modules/
 .claude-flow/
 .claude/
 .remember/
+.vercel
+.env*

@@ -2,11 +2,18 @@ import { supabase } from './supabase.js';
 import { notify } from './notify.js';
 
 const REMIND_BEFORE_MS = 3 * 60 * 60 * 1000; // ~3h before start
-const TICK_MS = 5 * 60_000;
 
-// Events starting within the window, not cancelled, not yet reminded.
-// reminder_sent_at is set even with zero followers so the scan shrinks.
-async function tick() {
+/**
+ * Un giro di promemoria: gli eventi che iniziano entro la finestra, non
+ * annullati e non ancora avvisati. `reminder_sent_at` viene scritto anche
+ * senza follower, così la scansione si accorcia da sola.
+ *
+ * Lo chiama `POST /cron/reminders` da uno scheduler esterno, non un timer
+ * interno: su Fluid compute il processo dorme quando non arrivano richieste.
+ *
+ * Ritorna quanti eventi ha lavorato — è quello che finisce nel log del cron.
+ */
+export async function tick() {
   const now = new Date();
   const horizon = new Date(now.getTime() + REMIND_BEFORE_MS);
   const { data: due, error } = await supabase
@@ -17,9 +24,23 @@ async function tick() {
     .gte('starts_at', now.toISOString())
     .lte('starts_at', horizon.toISOString())
     .limit(50);
-  if (error || !due?.length) return;
+  if (error || !due?.length) return 0;
 
+  let done = 0;
   for (const ev of due) {
+    // Si marca PRIMA di avvisare, e solo se la riga era ancora libera: due
+    // giri sovrapposti (uno lento più il successivo) altrimenti manderebbero
+    // il promemoria due volte a tutti. `notify` è best-effort e non solleva
+    // mai, quindi anticiparlo non fa perdere niente che non fosse già perso.
+    const { data: claimed } = await supabase
+      .from('events')
+      .update({ reminder_sent_at: new Date().toISOString() })
+      .eq('id', ev.id)
+      .is('reminder_sent_at', null)
+      .select('id')
+      .maybeSingle();
+    if (!claimed) continue;
+
     const { data: fans } = await supabase
       .from('follows')
       .select('user_id')
@@ -32,16 +53,7 @@ async function tick() {
         link: '/?tab=eventi',
       });
     }
-    await supabase
-      .from('events')
-      .update({ reminder_sent_at: new Date().toISOString() })
-      .eq('id', ev.id);
+    done++;
   }
-}
-
-// ponytail: in-process timer — reminders pause while the API is down and fire
-// on restart; move to pg_cron + Edge Function if that ever matters.
-export function startReminderWorker() {
-  tick().catch(() => {});
-  setInterval(() => tick().catch(() => {}), TICK_MS);
+  return done;
 }

@@ -21,7 +21,7 @@ const OVERPASS_URLS = (process.env.OVERPASS_URL
       'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
     ]);
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org';
-const UA = process.env.OSM_USER_AGENT || 'rabar/1.0 (https://github.com/rabar; contact: admin@rabar.app)';
+const UA = process.env.OSM_USER_AGENT || 'rabar/1.0 (https://github.com/rabar; contact: admin@rabar.it)';
 const OVERPASS_TIMEOUT_MS = Number(process.env.OVERPASS_TIMEOUT_MS) || 20000;
 
 // Fire the query at every mirror simultaneously; resolve with the first 200.

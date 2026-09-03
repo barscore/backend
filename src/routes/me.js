@@ -18,7 +18,7 @@ me.get('/', async (c) => {
 
   const { data: profile, error } = await supabase
     .from('profiles')
-    .select('id, username, avatar_url, created_at, plus_until')
+    .select('id, username, avatar_url, created_at, plus_until, rewarded_count')
     .eq('id', user.id)
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load profile');
@@ -41,6 +41,25 @@ me.get('/', async (c) => {
       plus: isPlus(profile),
     },
   });
+});
+
+/** POST /me/rewarded — one AdMob rewarded ad watched to the end. Increments the
+ *  counter that unlocks the "mar7yyy" theme and returns the new value; the
+ *  RPC caps it at 10 (REWARDS_FOR_THEME), so repeated calls plateau.
+ *
+ *  ponytail: nothing here proves the ad was really watched — that would need
+ *  AdMob server-side verification. The reward is a colour palette and the cap
+ *  is server-side, so the worst a forged client gets is a theme.
+ */
+// 20/min e non 5 come le segnalazioni: un rewarded dura mezzo minuto, ma
+// dietro un NAT di rete mobile ci sono molti utenti sullo stesso IP.
+me.post('/rewarded', rateLimiter({ windowMs: 60_000, max: 20 }), async (c) => {
+  const user = c.get('user');
+
+  const { data, error } = await supabase.rpc('add_rewarded_view', { p_user: user.id });
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not record the reward');
+
+  return c.json({ rewarded_count: data ?? 0 });
 });
 
 /** GET /me/ratings — the caller's own ratings, with the rated bar attached. */

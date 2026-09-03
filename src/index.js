@@ -26,7 +26,7 @@ import pushRoutes from './routes/push.js';
 import boostRoutes from './routes/boosts.js';
 import plusRoutes from './routes/plus.js';
 import stripeWebhookRoutes from './routes/stripeWebhook.js';
-import { startReminderWorker } from './lib/reminderWorker.js';
+import cronRoutes from './routes/cron.js';
 
 const app = new Hono();
 
@@ -85,6 +85,9 @@ app.use('*', async (c, next) => {
   if (c.req.path.startsWith('/admin')) return next();
   // Stripe retries must land even in maintenance (signature-verified anyway).
   if (c.req.path === '/stripe/webhook') return next();
+  // Same for the scheduler: it authenticates with CRON_SECRET, has no Bearer
+  // token, and beta_mode would otherwise silently stop every reminder.
+  if (c.req.path.startsWith('/cron/')) return next();
 
   const { data: settings } = await supabase
     .from('app_settings')
@@ -138,6 +141,7 @@ app.route('/push', pushRoutes);
 app.route('/boosts', boostRoutes);
 app.route('/plus', plusRoutes);
 app.route('/stripe', stripeWebhookRoutes);
+app.route('/cron', cronRoutes);
 
 app.notFound((c) =>
   c.json({ error: 'Not found', code: 'NOT_FOUND', statusCode: 404 }, 404),
@@ -149,6 +153,11 @@ serve({ fetch: app.fetch, port }, (info) => {
   console.log(`rabar API listening on http://localhost:${info.port}`);
 });
 
-startReminderWorker();
+// I promemoria eventi non hanno più un timer interno: li chiama pg_cron su
+// Supabase via POST /cron/reminders. Senza il segreto l'endpoint risponde 401
+// a tutti, quindi i promemoria non partirebbero e nessuno se ne accorgerebbe.
+if (!process.env.CRON_SECRET) {
+  console.warn('[rabar] CRON_SECRET non impostato: /cron/reminders rifiuta tutto, promemoria eventi fermi');
+}
 
 export default app;

@@ -21,6 +21,42 @@ function invoiceSubscriptionId(invoice) {
   return typeof sub === 'string' ? sub : (sub?.id ?? null);
 }
 
+/**
+ * Fulfilment di una Checkout Session pagata.
+ *
+ * Idempotente: la subscription passa da syncSubscription (che riscrive sempre
+ * lo stesso stato) e il boost da un UPDATE filtrato su `status = 'pending'`,
+ * quindi una redelivery di Stripe non concede niente due volte.
+ */
+async function fulfillSession(session) {
+  // rabar+ — abbonamento: la sessione porta l'id utente nei metadata, il
+  // diritto lo scrive syncSubscription leggendo la subscription vera. Nessun
+  // controllo sul pagamento qui: syncSubscription concede solo per gli stati
+  // che danno diritto, quindi una subscription ancora `incomplete` non regala
+  // nulla — sara' il customer.subscription.updated dell'attivazione a farlo.
+  if (session.mode === 'subscription' && session.subscription) {
+    const sub = await stripe.subscriptions.retrieve(
+      typeof session.subscription === 'string' ? session.subscription : session.subscription.id,
+    );
+    await syncSubscription(sub, { userId: session.metadata?.user_id });
+  }
+
+  // Boost — pagamento una tantum, e qui il controllo serve: e' merce concessa
+  // subito, contro un incasso che con un metodo asincrono puo' ancora fallire.
+  const orderId = session.metadata?.order_id;
+  if (!orderId || session.payment_status !== 'paid') return;
+
+  const { data: order } = await supabase
+    .from('boost_orders')
+    .update({ status: 'paid', paid_at: new Date().toISOString() })
+    .eq('id', orderId)
+    .eq('status', 'pending')
+    .select('event_id, bar_id, tier')
+    .maybeSingle();
+
+  if (order) await applyBoost(order);
+}
+
 hook.post('/webhook', async (c) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return c.json({ received: true });
 
@@ -35,31 +71,15 @@ hook.post('/webhook', async (c) => {
     return c.json({ error: 'Invalid signature', code: 'UNAUTHORIZED', statusCode: 400 }, 400);
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-
-    // rabar+ — abbonamento: la sessione porta l'id utente nei metadata, il
-    // diritto lo scrive syncSubscription leggendo la subscription vera.
-    if (session.mode === 'subscription' && session.subscription) {
-      const sub = await stripe.subscriptions.retrieve(
-        typeof session.subscription === 'string' ? session.subscription : session.subscription.id,
-      );
-      await syncSubscription(sub, { userId: session.metadata?.user_id });
-    }
-
-    // Boost — pagamento una tantum.
-    const orderId = session.metadata?.order_id;
-    if (orderId) {
-      const { data: order } = await supabase
-        .from('boost_orders')
-        .update({ status: 'paid', paid_at: new Date().toISOString() })
-        .eq('id', orderId)
-        .eq('status', 'pending')
-        .select('event_id, bar_id, tier')
-        .maybeSingle();
-
-      if (order) await applyBoost(order);
-    }
+  // Una sessione di Checkout si "completa" prima di essere pagata quando il
+  // metodo e' asincrono (SEPA, Bancontact): l'incasso arriva giorni dopo, con
+  // async_payment_succeeded. Entrambi gli eventi passano di qui, ed e'
+  // `payment_status` a decidere, non il tipo di evento.
+  if (
+    event.type === 'checkout.session.completed' ||
+    event.type === 'checkout.session.async_payment_succeeded'
+  ) {
+    await fulfillSession(event.data.object);
   }
 
   // Rinnovo, cambio piano, disdetta, pagamento fallito: tutti finiscono nello
