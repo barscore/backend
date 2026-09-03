@@ -39,6 +39,11 @@ async function sendPush(userIds, payload) {
 // Fan-out a notification to a set of users: one `notifications` row each,
 // plus Web Push delivery. Best-effort by design: a failed notification must
 // never fail the write that triggered it.
+//
+// `type` is constrained by a CHECK in add_organizers.sql and read by nothing in
+// the clients — the bell renders title/body/link. Every "we reviewed what you
+// submitted" verdict therefore reuses request_approved / request_rejected
+// rather than growing the constraint one enum value per queue.
 export async function notify(userIds, { type, title, body = null, link = null }) {
   const ids = [...new Set(userIds)].filter(Boolean);
   if (ids.length === 0) return;

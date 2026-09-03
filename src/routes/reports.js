@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { rateLimiter } from '../middleware/rateLimiter.js';
+import { notify } from '../lib/notify.js';
 import {
   createReportSchema,
   listReportsQuerySchema,
@@ -72,11 +73,24 @@ reports.patch('/:id', async (c) => {
     .from('user_reports')
     .update({ status, updated_at: new Date().toISOString() })
     .eq('id', id)
-    .select('id, status')
+    .select('id, status, type, created_by')
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update report');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Segnalazione non trovata');
-  return c.json({ report: data });
+
+  // No link: a report has no page of its own, and the bell renders a row
+  // without a chevron when there is nowhere to go.
+  if (status === 'done' || status === 'rejected') {
+    await notify([data.created_by], {
+      type: status === 'done' ? 'request_approved' : 'request_rejected',
+      title: status === 'done' ? 'Segnalazione risolta' : 'Segnalazione archiviata',
+      body:
+        status === 'done'
+          ? `La tua segnalazione (${data.type}) è stata presa in carico e risolta. Grazie!`
+          : `La tua segnalazione (${data.type}) è stata esaminata e archiviata senza interventi.`,
+    });
+  }
+  return c.json({ report: { id: data.id, status: data.status } });
 });
 
 /** DELETE /reports/:id — drop a handled/spam report. */
