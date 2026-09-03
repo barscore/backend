@@ -5,6 +5,25 @@ import { AppError } from '../middleware/errorHandler.js';
 import { uuidParam } from '../schemas/common.js';
 import { reviewSchema } from '../schemas/organizerSchemas.js';
 import { notify } from '../lib/notify.js';
+import { signedProofUrls } from '../lib/proofs.js';
+
+/**
+ * Swap the stored storage paths for short-lived signed URLs, in one batch for
+ * the whole page. The bucket is private: a raw path is useless to the browser,
+ * and these links expire.
+ */
+async function withProofUrls(rows) {
+  const paths = [...new Set(rows.flatMap((r) => r.proof_files ?? []))];
+  const signed = await signedProofUrls(paths);
+  const byPath = new Map(signed.map((s) => [s.path, s.url]));
+  return rows.map((r) => ({
+    ...r,
+    proofs: (r.proof_files ?? [])
+      .map((p) => ({ path: p, url: byPath.get(p) ?? null, pdf: p.toLowerCase().endsWith('.pdf') }))
+      .filter((p) => p.url),
+    proof_files: undefined,
+  }));
+}
 
 // Staff moderation: organizer upgrade requests + bar ownership claims.
 // Mounted at /admin/organizers.
@@ -17,7 +36,7 @@ organizers.get('/requests', async (c) => {
   let query = supabase
     .from('organizer_requests')
     .select(
-      'id, user_id, requested_type, proof, channels, channels_other, collaborations, status, admin_note, created_at, profiles!organizer_requests_user_id_fkey(username)',
+      'id, user_id, requested_type, proof_files, note, collaborations, status, admin_note, created_at, profiles!organizer_requests_user_id_fkey(username)',
     )
     .order('created_at', { ascending: false })
     .limit(200);
@@ -25,13 +44,12 @@ organizers.get('/requests', async (c) => {
 
   const { data, error } = await query;
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load requests');
-  return c.json({
-    requests: (data ?? []).map((r) => ({
-      ...r,
-      username: r.profiles?.username ?? null,
-      profiles: undefined,
-    })),
-  });
+  const rows = (data ?? []).map((r) => ({
+    ...r,
+    username: r.profiles?.username ?? null,
+    profiles: undefined,
+  }));
+  return c.json({ requests: await withProofUrls(rows) });
 });
 
 /** POST /admin/organizers/requests/:id/approve — grant the organizer role. */
@@ -104,7 +122,7 @@ organizers.get('/claims', async (c) => {
   let query = supabase
     .from('bar_claims')
     .select(
-      'id, user_id, bar_id, proof, status, admin_note, created_at, bars(name, city), profiles!bar_claims_user_id_fkey(username)',
+      'id, user_id, bar_id, proof_files, note, status, admin_note, created_at, bars(name, city), profiles!bar_claims_user_id_fkey(username)',
     )
     .order('created_at', { ascending: false })
     .limit(200);
@@ -112,16 +130,15 @@ organizers.get('/claims', async (c) => {
 
   const { data, error } = await query;
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load claims');
-  return c.json({
-    claims: (data ?? []).map((cl) => ({
-      ...cl,
-      username: cl.profiles?.username ?? null,
-      bar_name: cl.bars?.name ?? null,
-      bar_city: cl.bars?.city ?? null,
-      profiles: undefined,
-      bars: undefined,
-    })),
-  });
+  const rows = (data ?? []).map((cl) => ({
+    ...cl,
+    username: cl.profiles?.username ?? null,
+    bar_name: cl.bars?.name ?? null,
+    bar_city: cl.bars?.city ?? null,
+    profiles: undefined,
+    bars: undefined,
+  }));
+  return c.json({ claims: await withProofUrls(rows) });
 });
 
 /** POST /admin/organizers/claims/:id/approve — set the bar's owner. */
@@ -151,6 +168,16 @@ organizers.post('/claims/:id/approve', async (c) => {
     .maybeSingle();
   if (ownErr) throw new AppError(500, 'INTERNAL_ERROR', 'Assegnazione non riuscita');
   if (!bar) throw new AppError(409, 'CONFLICT', 'Il bar ha già un proprietario');
+
+  // Claiming a bar IS the way to become a "proprietario" — the settings form
+  // only offers pr/organizzatore. Never touch staff roles, and never downgrade
+  // an existing organizer's own type.
+  const { error: roleErr } = await supabase
+    .from('profiles')
+    .update({ role: 'organizer', organizer_type: 'proprietario' })
+    .eq('id', claim.user_id)
+    .in('role', ['user', 'betatester']);
+  if (roleErr) throw new AppError(500, 'INTERNAL_ERROR', 'Aggiornamento ruolo non riuscito');
 
   await notify([claim.user_id], {
     type: 'claim_approved',

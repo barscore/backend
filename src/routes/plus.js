@@ -105,6 +105,15 @@ plus.post('/checkout', requireAuth, async (c) => {
     // solo la subscription, non la sessione di checkout.
     subscription_data: { metadata },
     allow_promotion_codes: true,
+    // La carta si chiede solo se c'e' davvero qualcosa da pagare oggi. Col
+    // default (`always`) Stripe la pretende anche a totale zero — un codice
+    // sconto al 100% restava bloccato dietro l'autorizzazione da 0 €, che
+    // diverse banche rifiutano. Per un abbonamento normale l'importo dovuto
+    // non e' mai zero, quindi la carta viene chiesta come prima.
+    // Attenzione se un giorno esistono coupon 100% a DURATA LIMITATA: alla
+    // fine dello sconto l'abbonamento si troverebbe senza metodo di pagamento
+    // e il rinnovo fallirebbe. Oggi l'unico coupon al 100% e' `forever`.
+    payment_method_collection: 'if_required',
     success_url: `${origin}/plus?success=1`,
     cancel_url: `${origin}/plus`,
   });

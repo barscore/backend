@@ -11,8 +11,14 @@ const targetSchema = z
     tier,
     event_id: z.string().uuid().optional(),
     bar_id: z.string().uuid().optional(),
+    // Visibility radius (km) for a bar boost, chosen on the checkout slider.
+    // Meaningless for events, so it's rejected unless bar_id is set.
+    sponsor_radius_km: z.number().int().min(1).max(50).nullish(),
   })
-  .refine(oneTarget, oneTargetMessage);
+  .refine(oneTarget, oneTargetMessage)
+  .refine((v) => !v.sponsor_radius_km || !!v.bar_id, {
+    message: 'sponsor_radius_km richiede bar_id',
+  });
 
 export const boostCheckoutSchema = targetSchema;
 

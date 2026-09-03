@@ -5,7 +5,11 @@ import { AppError } from '../middleware/errorHandler.js';
 import { rateLimiter } from '../middleware/rateLimiter.js';
 import { isPlus } from '../lib/plus.js';
 import { myDrinkVotesQuerySchema } from '../schemas/drinkSchemas.js';
-import { createOrganizerRequestSchema } from '../schemas/organizerSchemas.js';
+import {
+  createOrganizerRequestSchema,
+  proofUploadSchema,
+} from '../schemas/organizerSchemas.js';
+import { assertOwnedPaths, createProofUploadUrls } from '../lib/proofs.js';
 
 // Account-scoped self routes. All require auth; a user only ever reads their own
 // profile and ratings. Credential changes go through supabase-js on the frontend.
@@ -97,6 +101,24 @@ me.get('/drink-votes', async (c) => {
   return c.json({ votes: data ?? [] });
 });
 
+/**
+ * POST /me/uploads/proof — signed upload URLs for verification attachments.
+ *
+ * The client never gets storage credentials: it asks for 1–3 slots, uploads the
+ * bytes straight to the returned URLs, then sends the paths back with the form.
+ * The path is chosen here (under the caller's own folder), so a client cannot
+ * write anywhere else in the bucket.
+ */
+me.post('/uploads/proof', rateLimiter({ windowMs: 60_000, max: 20 }), async (c) => {
+  const user = c.get('user');
+  const { files } = proofUploadSchema.parse(await c.req.json());
+  const uploads = await createProofUploadUrls(
+    user.id,
+    files.map((f) => f.ext),
+  );
+  return c.json({ uploads });
+});
+
 /** GET /me/organizer-request — latest upgrade request (or null). */
 me.get('/organizer-request', async (c) => {
   const user = c.get('user');
@@ -111,23 +133,28 @@ me.get('/organizer-request', async (c) => {
   return c.json({ request: data ?? null });
 });
 
-/** POST /me/organizer-request — the 3-question upgrade form. */
+/**
+ * POST /me/organizer-request — upgrade to a PR / organizzatore account.
+ *
+ * "proprietario" is not requestable here any more: that role comes from
+ * claiming a bar on its own page (`POST /bars/:id/claim`).
+ */
 me.post('/organizer-request', rateLimiter({ windowMs: 60_000, max: 5 }), async (c) => {
   const user = c.get('user');
   if (user.role === 'organizer') {
     throw new AppError(409, 'CONFLICT', 'Sei già un organizzatore');
   }
   const body = createOrganizerRequestSchema.parse(await c.req.json());
+  assertOwnedPaths(user.id, body.proof_files);
 
   const { data, error } = await supabase
     .from('organizer_requests')
     .insert({
       user_id: user.id,
       requested_type: body.requested_type,
-      proof: body.proof,
-      channels: body.channels,
-      channels_other: body.channels_other ?? null,
-      collaborations: body.collaborations,
+      proof_files: body.proof_files,
+      note: body.note ?? null,
+      collaborations: body.collaborations ?? null,
     })
     .select('id, requested_type, status, created_at')
     .single();

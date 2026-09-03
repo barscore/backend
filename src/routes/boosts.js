@@ -4,7 +4,15 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { uuidParam } from '../schemas/common.js';
-import { TIERS, applyBoost, assertOwnsTarget } from '../lib/boostFulfillment.js';
+import {
+  TIERS,
+  applyBoost,
+  assertOwnsTarget,
+  radiusSurchargeCents,
+  RADIUS_CENTS_PER_KM_PER_DAY,
+  SPONSOR_RADIUS_MIN_KM,
+  SPONSOR_RADIUS_MAX_KM,
+} from '../lib/boostFulfillment.js';
 import { verifySignedTransaction } from '../lib/appleIap.js';
 import { appleOrderSchema, appleVerifySchema, boostCheckoutSchema } from '../schemas/boostSchemas.js';
 
@@ -18,9 +26,17 @@ export { TIERS };
 
 const boosts = new Hono();
 
-/** GET /boosts/tiers — public price list for the boost modal. */
+/** GET /boosts/tiers — public price list + radius rate for the boost modal. */
 boosts.get('/tiers', (c) =>
-  c.json({ tiers: Object.entries(TIERS).map(([tier, t]) => ({ tier, ...t })) }),
+  c.json({
+    tiers: Object.entries(TIERS).map(([tier, t]) => ({ tier, ...t })),
+    // Lets the bar modal show a live total as the radius slider moves.
+    radius: {
+      min_km: SPONSOR_RADIUS_MIN_KM,
+      max_km: SPONSOR_RADIUS_MAX_KM,
+      cents_per_km_per_day: RADIUS_CENTS_PER_KM_PER_DAY,
+    },
+  }),
 );
 
 /** GET /boosts/session/:sid — order status for the checkout result page. */
@@ -41,8 +57,12 @@ boosts.get('/session/:sid', requireAuth, async (c) => {
 boosts.post('/checkout', requireAuth, requireRole('organizer'), async (c) => {
   if (!stripe) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
   const user = c.get('user');
-  const { tier, event_id, bar_id } = boostCheckoutSchema.parse(await c.req.json());
+  const { tier, event_id, bar_id, sponsor_radius_km } = boostCheckoutSchema.parse(
+    await c.req.json(),
+  );
   const t = TIERS[tier];
+  const radiusKm = bar_id ? sponsor_radius_km ?? null : null;
+  const amount_cents = t.amount_cents + radiusSurchargeCents(t.days, radiusKm);
 
   // Ownership gate: own events / own (claimed) bar only.
   const label = await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
@@ -54,7 +74,8 @@ boosts.post('/checkout', requireAuth, requireRole('organizer'), async (c) => {
       event_id: event_id ?? null,
       bar_id: bar_id ?? null,
       tier,
-      amount_cents: t.amount_cents,
+      sponsor_radius_km: radiusKm,
+      amount_cents,
     })
     .select('id')
     .single();
@@ -68,7 +89,7 @@ boosts.post('/checkout', requireAuth, requireRole('organizer'), async (c) => {
         quantity: 1,
         price_data: {
           currency: 'eur',
-          unit_amount: t.amount_cents,
+          unit_amount: amount_cents,
           product_data: { name: label },
         },
       },
@@ -101,8 +122,11 @@ const APPLE_PRODUCTS = {
 /** POST /boosts/apple/order — open a pending order for an IAP. */
 boosts.post('/apple/order', requireAuth, requireRole('organizer'), async (c) => {
   const user = c.get('user');
-  const { tier, event_id, bar_id } = appleOrderSchema.parse(await c.req.json());
+  const { tier, event_id, bar_id, sponsor_radius_km } = appleOrderSchema.parse(
+    await c.req.json(),
+  );
   const t = TIERS[tier];
+  const radiusKm = bar_id ? sponsor_radius_km ?? null : null;
 
   await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
 
@@ -113,6 +137,9 @@ boosts.post('/apple/order', requireAuth, requireRole('organizer'), async (c) => 
       event_id: event_id ?? null,
       bar_id: bar_id ?? null,
       tier,
+      sponsor_radius_km: radiusKm,
+      // Apple charges the fixed StoreKit product price; the radius surcharge is
+      // not billed on iOS yet (real IAP products land with the dev account).
       amount_cents: t.amount_cents,
       provider: 'apple',
     })
@@ -178,7 +205,7 @@ boosts.post('/apple/verify', requireAuth, async (c) => {
     })
     .eq('id', order.id)
     .eq('status', 'pending')
-    .select('id, status, tier, event_id, bar_id, paid_at')
+    .select('id, status, tier, event_id, bar_id, sponsor_radius_km, paid_at')
     .maybeSingle();
 
   // Lost the race against a concurrent verification of the same order.

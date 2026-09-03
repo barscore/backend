@@ -100,7 +100,7 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
     const wanted = new Set(osmPlaces.map((p) => String(p.osm_node_id)));
     const { data } = await supabase
       .from('bars')
-      .select('id, osm_node_id, bar_ratings_summary(avg_overall, total_ratings)')
+      .select('id, osm_node_id, boost_until, bar_ratings_summary(avg_overall, total_ratings)')
       .not('osm_node_id', 'is', null)
       .limit(10000);
     byOsm = new Map(
@@ -109,6 +109,7 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
         .map((b) => [String(b.osm_node_id), b]),
     );
   }
+  const now = Date.now();
   return osmPlaces.map((p) => {
     const match = byOsm.get(String(p.osm_node_id));
     return {
@@ -116,12 +117,55 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
       id: match?.id ?? null,
       avg_overall: match?.bar_ratings_summary?.avg_overall ?? 0,
       total_ratings: match?.bar_ratings_summary?.total_ratings ?? 0,
+      sponsored: !!match?.boost_until && new Date(match.boost_until).getTime() > now,
       distance_km:
         lat != null && lng != null
           ? Math.round(haversineKm(lat, lng, p.lat, p.lng) * 100) / 100
           : null,
     };
   });
+}
+
+/**
+ * Sponsored bars that the owner paid to show beyond the viewer's own radius.
+ * Returned shaped like an OSM place (so clients render them in the same list),
+ * flagged `sponsored: true`, and only within `min(sponsor_radius_km, 50)` km of
+ * the viewer. `haveOsm` / `haveId` are the ids already in the /nearby result —
+ * a sponsored bar the viewer is *also* near stays where it is (already flagged
+ * by enrichWithRatings), it isn't added twice.
+ */
+async function nearbySponsoredExtras(lat, lng, haveOsm, haveId) {
+  const { data } = await supabase
+    .from('bars')
+    .select(
+      'id, osm_node_id, osm_type, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url, sponsor_radius_km, bar_ratings_summary(avg_overall, total_ratings)',
+    )
+    .eq('is_active', true)
+    .gt('boost_until', new Date().toISOString())
+    .not('sponsor_radius_km', 'is', null)
+    // Clients type a place's osm_node_id as non-null — an admin bar with no OSM
+    // node can't ride this list (it also has no map pin).
+    .not('osm_node_id', 'is', null);
+
+  return (data ?? [])
+    .filter((b) => !haveId.has(b.id) && !haveOsm.has(String(b.osm_node_id)))
+    .map((b) => ({
+      ...b,
+      distance_km: Math.round(haversineKm(lat, lng, b.lat, b.lng) * 100) / 100,
+      avg_overall: b.bar_ratings_summary?.avg_overall ?? 0,
+      total_ratings: b.bar_ratings_summary?.total_ratings ?? 0,
+      sponsored: true,
+      bar_ratings_summary: undefined,
+    }))
+    .filter((b) => b.distance_km <= Math.min(b.sponsor_radius_km, 50));
+}
+
+/** Prepend the out-of-radius sponsored bars to an enriched /nearby result. */
+async function withSponsoredExtras(enriched, lat, lng) {
+  const haveOsm = new Set(enriched.map((p) => String(p.osm_node_id)));
+  const haveId = new Set(enriched.map((p) => p.id).filter(Boolean));
+  const extras = await nearbySponsoredExtras(lat, lng, haveOsm, haveId);
+  return extras.length ? [...extras, ...enriched] : enriched;
 }
 
 const nearbySchema = z.object({
@@ -164,12 +208,12 @@ places.get('/nearby', async (c) => {
       results = await fetchAndCache(key, lat, lng, radius_km);
     }
     const enriched = await enrichWithRatings(results, lat, lng);
-    return c.json({ places: enriched });
+    return c.json({ places: await withSponsoredExtras(enriched, lat, lng) });
   } catch (e) {
     // Upstream dead but we have *some* cache → serve it rather than 502.
     if (cached) {
       const enriched = await enrichWithRatings(cached.places, lat, lng);
-      return c.json({ places: enriched, stale: true });
+      return c.json({ places: await withSponsoredExtras(enriched, lat, lng), stale: true });
     }
     throw new AppError(502, 'UPSTREAM_ERROR', 'OpenStreetMap query failed');
   }

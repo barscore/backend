@@ -13,6 +13,7 @@ import {
 } from '../schemas/barSchemas.js';
 import { listTopQuerySchema } from '../schemas/drinkSchemas.js';
 import { createClaimSchema } from '../schemas/organizerSchemas.js';
+import { assertOwnedPaths } from '../lib/proofs.js';
 import { fetchElement } from '../lib/osm.js';
 import ratings from './ratings.js';
 
@@ -179,16 +180,22 @@ bars.get('/:id', async (c) => {
   });
 });
 
-/** POST /bars/:id/claim — an organizer claims ownership of a bar. */
+/**
+ * POST /bars/:id/claim — "sono io il proprietario di questo bar".
+ *
+ * Open to any signed-in user, not just organizers: this *is* the way to become
+ * one. Approval (`/admin/organizers/claims/:id/approve`) sets `bars.owner_id`
+ * and promotes the claimant to `organizer` / `proprietario`.
+ */
 bars.post(
   '/:id/claim',
   requireAuth,
-  requireRole('organizer'),
   rateLimiter({ windowMs: 60_000, max: 5 }),
   async (c) => {
     const barId = uuidParam(c);
-    const { proof } = createClaimSchema.parse(await c.req.json());
+    const { proof_files, note } = createClaimSchema.parse(await c.req.json());
     const user = c.get('user');
+    assertOwnedPaths(user.id, proof_files);
 
     const { data: bar, error: barErr } = await supabase
       .from('bars')
@@ -201,7 +208,7 @@ bars.post(
 
     const { data, error } = await supabase
       .from('bar_claims')
-      .insert({ user_id: user.id, bar_id: barId, proof })
+      .insert({ user_id: user.id, bar_id: barId, proof_files, note: note ?? null })
       .select('id, status, created_at')
       .single();
     if (error?.code === '23505') {

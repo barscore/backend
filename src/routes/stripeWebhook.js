@@ -51,7 +51,7 @@ async function fulfillSession(session) {
     .update({ status: 'paid', paid_at: new Date().toISOString() })
     .eq('id', orderId)
     .eq('status', 'pending')
-    .select('event_id, bar_id, tier')
+    .select('event_id, bar_id, tier, sponsor_radius_km')
     .maybeSingle();
 
   if (order) await applyBoost(order);

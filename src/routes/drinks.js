@@ -249,7 +249,7 @@ drinks.get('/:id/bars', async (c) => {
   const { data, error, count } = await supabase
     .from('drink_bar_summary')
     .select(
-      'avg_rating, total_ratings, bars!inner(id, name, address, city, lat, lng, cover_image_url)',
+      'avg_rating, total_ratings, bars!inner(id, name, address, city, lat, lng, cover_image_url, boost_until)',
       { count: 'exact' },
     )
     .eq('drink_id', id)
@@ -261,11 +261,20 @@ drinks.get('/:id/bars', async (c) => {
 
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load ranking');
 
-  const flattened = (data ?? []).map((row) => ({
-    ...row.bars,
-    avg_rating: row.avg_rating,
-    total_ratings: row.total_ratings,
-  }));
+  const now = Date.now();
+  const flattened = (data ?? []).map((row) => {
+    const { boost_until, ...bar } = row.bars;
+    return {
+      ...bar,
+      avg_rating: row.avg_rating,
+      total_ratings: row.total_ratings,
+      sponsored: !!boost_until && new Date(boost_until).getTime() > now,
+    };
+  });
+  // ponytail: sponsored-first only within the fetched page — a sponsored bar on
+  // page 2 won't bubble to page 1. The geo path (the common one) orders in SQL;
+  // this coordless fallback isn't worth a second query.
+  flattened.sort((a, b) => b.sponsored - a.sponsored);
   return c.json({ bars: flattened, page, limit, total: count ?? 0 });
 });
 

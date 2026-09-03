@@ -13,6 +13,29 @@ export const TIERS = {
 };
 
 /**
+ * Extra visibility radius for a bar boost (km). Chosen on a 1..50 slider at
+ * checkout; a sponsored bar then shows up — and ranks first — for anyone within
+ * that distance, even outside their own search radius. 50 is the hard ceiling,
+ * enforced again in the SQL RPCs.
+ */
+export const SPONSOR_RADIUS_MIN_KM = 1;
+export const SPONSOR_RADIUS_MAX_KM = 50;
+
+/** Radius surcharge rate: cents per km per day. Tunable, defaults to 1.5. */
+export const RADIUS_CENTS_PER_KM_PER_DAY =
+  Number(process.env.BOOST_RADIUS_CENTS_PER_KM_PER_DAY) || 1.5;
+
+/**
+ * Price added on top of the duration tier for the chosen radius.
+ * `radius_km` null/0 (e.g. an event boost, or a legacy bar boost) ⇒ no surcharge.
+ */
+export function radiusSurchargeCents(days, radiusKm) {
+  if (!radiusKm || !days) return 0;
+  const capped = Math.min(Math.max(radiusKm, SPONSOR_RADIUS_MIN_KM), SPONSOR_RADIUS_MAX_KM);
+  return Math.round(RADIUS_CENTS_PER_KM_PER_DAY * capped * days);
+}
+
+/**
  * Ownership gate for a boost target: your own event, or a bar you have claimed.
  * Runs before anyone is charged, on both the Stripe and the Apple path — which
  * is why it lives here rather than inside either one.
@@ -54,7 +77,7 @@ export async function assertOwnsTarget(user, { event_id, bar_id, days }) {
  * Shared by the Stripe webhook and the Apple verification endpoint so the two
  * payment providers can never drift on what a boost actually does.
  */
-export async function applyBoost({ event_id, bar_id, tier }) {
+export async function applyBoost({ event_id, bar_id, tier, sponsor_radius_km }) {
   const days = TIERS[tier]?.days;
   if (!days) return;
 
@@ -63,15 +86,36 @@ export async function applyBoost({ event_id, bar_id, tier }) {
 
   const { data: row } = await supabase
     .from(table)
-    .select('boost_until')
+    .select(bar_id ? 'boost_until, sponsor_radius_km' : 'boost_until')
     .eq('id', targetId)
     .maybeSingle();
 
-  const base =
-    row?.boost_until && new Date(row.boost_until) > new Date()
-      ? new Date(row.boost_until)
-      : new Date();
+  const stillActive = row?.boost_until && new Date(row.boost_until) > new Date();
+  const base = stillActive ? new Date(row.boost_until) : new Date();
   const until = new Date(base.getTime() + days * 86_400_000).toISOString();
 
-  await supabase.from(table).update({ boost_until: until }).eq('id', targetId);
+  const update = { boost_until: until };
+  // Bar boosts carry a visibility radius; stacking keeps the larger one while a
+  // boost is still running so a cheap top-up can't shrink an existing reach.
+  if (bar_id && sponsor_radius_km) {
+    update.sponsor_radius_km = stillActive
+      ? Math.max(row?.sponsor_radius_km || 0, sponsor_radius_km)
+      : sponsor_radius_km;
+  }
+
+  await supabase.from(table).update(update).eq('id', targetId);
+}
+
+// --- self-check: `SUPABASE_URL=http://localhost SUPABASE_SERVICE_ROLE_KEY=x node src/lib/boostFulfillment.js`
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const eq = (a, b, m) => {
+    if (a !== b) throw new Error(`${m}: expected ${b}, got ${a}`);
+  };
+  eq(radiusSurchargeCents(7, null), 0, 'no radius ⇒ no surcharge');
+  eq(radiusSurchargeCents(0, 25), 0, 'no days ⇒ no surcharge');
+  eq(radiusSurchargeCents(7, 25), Math.round(1.5 * 25 * 7), '7d / 25km');
+  eq(radiusSurchargeCents(30, 50), Math.round(1.5 * 50 * 30), '30d / 50km');
+  eq(radiusSurchargeCents(7, 999), radiusSurchargeCents(7, 50), 'radius capped at 50');
+  eq(radiusSurchargeCents(7, 0.2), radiusSurchargeCents(7, 1), 'radius floored at 1');
+  console.log('boostFulfillment self-check ok');
 }
