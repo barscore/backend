@@ -6,7 +6,7 @@ import { supabase } from './supabase.js';
 const vapidReady = !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
 if (vapidReady) {
   webpush.setVapidDetails(
-    process.env.VAPID_SUBJECT || 'mailto:admin@rabar.it',
+    process.env.VAPID_SUBJECT || 'mailto:martino.parisi@rabar.it',
     process.env.VAPID_PUBLIC_KEY,
     process.env.VAPID_PRIVATE_KEY,
   );
