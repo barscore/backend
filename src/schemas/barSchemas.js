@@ -25,19 +25,10 @@ export const updateBarSchema = createBarSchema.partial().extend({
   is_active: z.boolean().optional(),
 });
 
-// Keep only well-formed http(s) URLs; anything else (javascript:, data:,
-// malformed OSM tags) becomes null. Used at the /bars/resolve insert instead of
-// schema-level .url() because raw OSM tags are frequently malformed and a bad
-// tag must not reject the whole bar.
-export function sanitizeHttpUrl(v) {
-  if (typeof v !== 'string') return null;
-  try {
-    const u = new URL(v.trim());
-    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
-  } catch {
-    return null;
-  }
-}
+// Lives in lib/url.js now — lib/osm.js sanitizes the raw OSM tags too, and a
+// lib importing from schemas/ would be the wrong direction. Re-exported here so
+// the existing callers (routes/bars.js) keep their import path.
+export { sanitizeHttpUrl } from '../lib/url.js';
 
 // Find-or-create a bar from an OpenStreetMap place. Fields beyond the OSM id
 // are optional hints from the client; anything missing is backfilled from

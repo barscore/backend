@@ -21,6 +21,23 @@ const APP_APPLE_ID = process.env.APPLE_APP_APPLE_ID
   ? Number(process.env.APPLE_APP_APPLE_ID)
   : undefined;
 
+// A sandbox transaction costs nothing to produce — any test Apple ID signs one —
+// so accepting sandbox in production means giving boosts away. The verifier is
+// therefore built only where sandbox purchases are legitimate: outside
+// production, or when APPLE_ALLOW_SANDBOX is set on purpose for TestFlight,
+// whose builds sign sandbox transactions against the production backend.
+const ALLOW_SANDBOX =
+  process.env.NODE_ENV !== 'production' || process.env.APPLE_ALLOW_SANDBOX === '1';
+
+// No verifier at all = every purchase fails, and it fails quietly (the client
+// just sees a rejected receipt). Say so at startup, like index.js does for
+// CRON_SECRET.
+if (!APP_APPLE_ID && !ALLOW_SANDBOX) {
+  console.warn(
+    '[rabar] APPLE_APP_APPLE_ID non impostato e sandbox disattivata: POST /boosts/apple/verify rifiuta ogni acquisto',
+  );
+}
+
 let verifiers = null;
 
 function loadVerifiers() {
@@ -42,7 +59,9 @@ function loadVerifiers() {
       new SignedDataVerifier(rootCAs, true, Environment.PRODUCTION, BUNDLE_ID, APP_APPLE_ID),
     );
   }
-  built.push(new SignedDataVerifier(rootCAs, true, Environment.SANDBOX, BUNDLE_ID));
+  if (ALLOW_SANDBOX) {
+    built.push(new SignedDataVerifier(rootCAs, true, Environment.SANDBOX, BUNDLE_ID));
+  }
 
   verifiers = built;
   return verifiers;
@@ -52,9 +71,9 @@ function loadVerifiers() {
  * Verifies a signed StoreKit 2 transaction and returns its decoded payload.
  *
  * A transaction is bound to one environment, and the app cannot be trusted to
- * say which — TestFlight builds produce sandbox transactions against the same
- * backend. So production is tried first and sandbox second; a transaction that
- * verifies under neither is rejected.
+ * say which, so production is tried first and sandbox second — but sandbox only
+ * where ALLOW_SANDBOX says such a transaction can legitimately arrive. A
+ * transaction that verifies under no available verifier is rejected.
  */
 export async function verifySignedTransaction(signedTransaction) {
   const available = loadVerifiers();

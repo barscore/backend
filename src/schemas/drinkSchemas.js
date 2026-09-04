@@ -46,4 +46,6 @@ export const listDrinkSuggestionsQuerySchema = z.object({
 // Staff status change.
 export const updateDrinkSuggestionSchema = z.object({
   status: z.enum(['new', 'done', 'rejected']),
+  // Nota facoltativa dello staff, mostrata all'utente nella notifica.
+  admin_note: z.string().trim().max(500).optional(),
 });

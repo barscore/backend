@@ -3,6 +3,7 @@ import Stripe from 'stripe';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { uuidParam } from '../schemas/common.js';
 import {
   TIERS,
@@ -54,54 +55,62 @@ boosts.get('/session/:sid', requireAuth, async (c) => {
 });
 
 /** POST /boosts/checkout — create the Stripe Checkout Session for a boost. */
-boosts.post('/checkout', requireAuth, requireRole('organizer'), async (c) => {
-  if (!stripe) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
-  const user = c.get('user');
-  const { tier, event_id, bar_id, sponsor_radius_km } = boostCheckoutSchema.parse(
-    await c.req.json(),
-  );
-  const t = TIERS[tier];
-  const radiusKm = bar_id ? sponsor_radius_km ?? null : null;
-  const amount_cents = t.amount_cents + radiusSurchargeCents(t.days, radiusKm);
+// Ogni chiamata apre una riga boost_orders E una Checkout Session su Stripe:
+// senza limite un organizer approvato puo' riempire entrambe.
+boosts.post(
+  '/checkout',
+  requireAuth,
+  requireRole('organizer'),
+  sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'boost-checkout' }),
+  async (c) => {
+    if (!stripe) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
+    const user = c.get('user');
+    const { tier, event_id, bar_id, sponsor_radius_km } = boostCheckoutSchema.parse(
+      await c.req.json(),
+    );
+    const t = TIERS[tier];
+    const radiusKm = bar_id ? sponsor_radius_km ?? null : null;
+    const amount_cents = t.amount_cents + radiusSurchargeCents(t.days, radiusKm);
 
-  // Ownership gate: own events / own (claimed) bar only.
-  const label = await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
+    // Ownership gate: own events / own (claimed) bar only.
+    const label = await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
 
-  const { data: order, error } = await supabase
-    .from('boost_orders')
-    .insert({
-      user_id: user.id,
-      event_id: event_id ?? null,
-      bar_id: bar_id ?? null,
-      tier,
-      sponsor_radius_km: radiusKm,
-      amount_cents,
-    })
-    .select('id')
-    .single();
-  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Creazione ordine non riuscita');
+    const { data: order, error } = await supabase
+      .from('boost_orders')
+      .insert({
+        user_id: user.id,
+        event_id: event_id ?? null,
+        bar_id: bar_id ?? null,
+        tier,
+        sponsor_radius_km: radiusKm,
+        amount_cents,
+      })
+      .select('id')
+      .single();
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Creazione ordine non riuscita');
 
-  const origin = (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
-  const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    line_items: [
-      {
-        quantity: 1,
-        price_data: {
-          currency: 'eur',
-          unit_amount: amount_cents,
-          product_data: { name: label },
+    const origin = (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: 'eur',
+            unit_amount: amount_cents,
+            product_data: { name: label },
+          },
         },
-      },
-    ],
-    metadata: { order_id: order.id },
-    success_url: `${origin}/boost/esito?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${origin}/?tab=eventi`,
-  });
+      ],
+      metadata: { order_id: order.id },
+      success_url: `${origin}/boost/esito?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/?tab=eventi`,
+    });
 
-  await supabase.from('boost_orders').update({ stripe_session_id: session.id }).eq('id', order.id);
-  return c.json({ url: session.url });
-});
+    await supabase.from('boost_orders').update({ stripe_session_id: session.id }).eq('id', order.id);
+    return c.json({ url: session.url });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Apple in-app purchases (iOS client)
@@ -120,35 +129,43 @@ const APPLE_PRODUCTS = {
 };
 
 /** POST /boosts/apple/order — open a pending order for an IAP. */
-boosts.post('/apple/order', requireAuth, requireRole('organizer'), async (c) => {
-  const user = c.get('user');
-  const { tier, event_id, bar_id, sponsor_radius_km } = appleOrderSchema.parse(
-    await c.req.json(),
-  );
-  const t = TIERS[tier];
-  const radiusKm = bar_id ? sponsor_radius_km ?? null : null;
+// Come /checkout: qui la riga si apre prima che StoreKit abbia incassato,
+// quindi gli ordini pendenti si accumulano piu' facilmente.
+boosts.post(
+  '/apple/order',
+  requireAuth,
+  requireRole('organizer'),
+  sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'boost-order' }),
+  async (c) => {
+    const user = c.get('user');
+    const { tier, event_id, bar_id, sponsor_radius_km } = appleOrderSchema.parse(
+      await c.req.json(),
+    );
+    const t = TIERS[tier];
+    const radiusKm = bar_id ? sponsor_radius_km ?? null : null;
 
-  await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
+    await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
 
-  const { data: order, error } = await supabase
-    .from('boost_orders')
-    .insert({
-      user_id: user.id,
-      event_id: event_id ?? null,
-      bar_id: bar_id ?? null,
-      tier,
-      sponsor_radius_km: radiusKm,
-      // Apple charges the fixed StoreKit product price; the radius surcharge is
-      // not billed on iOS yet (real IAP products land with the dev account).
-      amount_cents: t.amount_cents,
-      provider: 'apple',
-    })
-    .select('id')
-    .single();
-  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Creazione ordine non riuscita');
+    const { data: order, error } = await supabase
+      .from('boost_orders')
+      .insert({
+        user_id: user.id,
+        event_id: event_id ?? null,
+        bar_id: bar_id ?? null,
+        tier,
+        sponsor_radius_km: radiusKm,
+        // Apple charges the fixed StoreKit product price; the radius surcharge is
+        // not billed on iOS yet (real IAP products land with the dev account).
+        amount_cents: t.amount_cents,
+        provider: 'apple',
+      })
+      .select('id')
+      .single();
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Creazione ordine non riuscita');
 
-  return c.json({ order_id: order.id, product_id: APPLE_PRODUCTS[tier] });
-});
+    return c.json({ order_id: order.id, product_id: APPLE_PRODUCTS[tier] });
+  },
+);
 
 /**
  * POST /boosts/apple/verify — verify a signed StoreKit transaction and fulfil.

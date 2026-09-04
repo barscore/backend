@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { tick } from '../lib/reminderWorker.js';
+import { supabase } from '../lib/supabase.js';
 import { AppError } from '../middleware/errorHandler.js';
 
 // Lavori pianificati, chiamati da uno scheduler ESTERNO (pg_cron + pg_net su
@@ -18,13 +19,19 @@ const cron = new Hono();
  * risposta racconta quanti byte erano giusti: con un endpoint che si può
  * chiamare quanto si vuole, è un segreto che si indovina un carattere alla
  * volta.
+ *
+ * Si confrontano gli SHA-256, non i byte: `timingSafeEqual` pretende due buffer
+ * della stessa lunghezza, e la guardia `a.length === b.length` che serve a non
+ * farlo lanciare è essa stessa un canale — esce prima, e chi prova capisce che
+ * la lunghezza indovinata era sbagliata. I digest sono sempre 32 byte, quindi
+ * non lancia mai e la lunghezza del segreto non trapela.
  */
 function secretOk(given) {
   const expected = process.env.CRON_SECRET;
   if (!expected || !given) return false;
-  const a = Buffer.from(given);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  const a = createHash('sha256').update(given).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
 }
 
 /** POST /cron/reminders — un giro di promemoria eventi (~3h prima dell'inizio). */
@@ -32,7 +39,18 @@ cron.post('/reminders', async (c) => {
   if (!secretOk(c.req.header('x-cron-secret'))) {
     throw new AppError(401, 'UNAUTHORIZED', 'Non autorizzato');
   }
-  return c.json({ ok: true, reminded: await tick() });
+  const reminded = await tick();
+
+  // Pulizia dei bucket scaduti del rate limiting, agganciata qui invece che a un
+  // suo scheduler: gira già ogni pochi minuti ed è l'unico lavoro periodico che
+  // abbiamo. Senza questa chiamata `rate_limits` non si sarebbe mai svuotata —
+  // la funzione esisteva ma non la invocava nessuno, e la tabella avrebbe tenuto
+  // una riga per ogni chiamante mai visto, per sempre. Best-effort: la pulizia
+  // che fallisce non deve far risultare fallito il giro dei promemoria.
+  const { data: pruned, error } = await supabase.rpc('prune_rate_limits');
+  if (error) console.error('[cron] prune_rate_limits fallita:', error.message);
+
+  return c.json({ ok: true, reminded, pruned: error ? null : (pruned ?? 0) });
 });
 
 export default cron;

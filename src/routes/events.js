@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
 import {
   nearbyEventsQuerySchema,
@@ -67,60 +68,69 @@ events.get('/', async (c) => {
  * POST /events — create (organizer/admin/moderator). When `bar_id` is given,
  * lat/lng are backfilled from that bar.
  */
-events.post('/', requireAuth, requireRole('organizer', 'admin', 'moderator'), async (c) => {
-  const body = createEventSchema.parse(await c.req.json());
-  const user = c.get('user');
+// Un evento non è solo una riga: la creazione fa fan-out di una notifica (e di
+// un Web Push) a ogni follower dell'organizzatore. Senza limite, un account
+// approvato può usarlo come megafono.
+events.post(
+  '/',
+  requireAuth,
+  requireRole('organizer', 'admin', 'moderator'),
+  sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'event-create' }),
+  async (c) => {
+    const body = createEventSchema.parse(await c.req.json());
+    const user = c.get('user');
 
-  let { lat, lng } = body;
-  if (body.bar_id) {
-    const { data: bar, error: barErr } = await supabase
-      .from('bars')
-      .select('lat, lng')
-      .eq('id', body.bar_id)
-      .maybeSingle();
-    if (barErr) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load bar');
-    if (!bar) throw new AppError(404, 'NOT_FOUND', 'Bar not found');
-    if (lat == null || lng == null) {
-      lat = bar.lat;
-      lng = bar.lng;
+    let { lat, lng } = body;
+    if (body.bar_id) {
+      const { data: bar, error: barErr } = await supabase
+        .from('bars')
+        .select('lat, lng')
+        .eq('id', body.bar_id)
+        .maybeSingle();
+      if (barErr) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load bar');
+      if (!bar) throw new AppError(404, 'NOT_FOUND', 'Bar not found');
+      if (lat == null || lng == null) {
+        lat = bar.lat;
+        lng = bar.lng;
+      }
     }
-  }
 
-  const { data, error } = await supabase
-    .from('events')
-    .insert({
-      bar_id: body.bar_id ?? null,
-      title: body.title,
-      description: body.description ?? null,
-      lat,
-      lng,
-      starts_at: body.starts_at,
-      ends_at: body.ends_at ?? null,
-      created_by: user.id,
-    })
-    .select('*')
-    .single();
+    const { data, error } = await supabase
+      .from('events')
+      .insert({
+        bar_id: body.bar_id ?? null,
+        title: body.title,
+        description: body.description ?? null,
+        lat,
+        lng,
+        starts_at: body.starts_at,
+        ends_at: body.ends_at ?? null,
+        created_by: user.id,
+      })
+      .select('*')
+      .single();
 
-  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not create event');
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not create event');
 
-  // Followers of the organizer get a "new event" ping (staff events skip it).
-  if (user.role === 'organizer') {
-    const { data: fans } = await supabase
-      .from('follows')
-      .select('user_id')
-      .eq('organizer_id', user.id);
-    await notify(
-      (fans ?? []).map((f) => f.user_id).filter((id) => id !== user.id),
-      {
-        type: 'new_event',
-        title: `Nuovo evento: ${data.title}`,
-        body: 'Un organizzatore che segui ha pubblicato un nuovo evento.',
-        link: '/?tab=eventi',
-      },
-    );
-  }
-  return c.json({ event: data }, 201);
-});
+    // Followers of the organizer get a "new event" ping (staff events skip it).
+    if (user.role === 'organizer') {
+      const { data: fans } = await supabase
+        .from('follows')
+        .select('user_id')
+        .eq('organizer_id', user.id);
+      await notify(
+        (fans ?? []).map((f) => f.user_id).filter((id) => id !== user.id),
+        {
+          type: 'new_event',
+          title: `Nuovo evento: ${data.title}`,
+          body: 'Un organizzatore che segui ha pubblicato un nuovo evento.',
+          link: '/?tab=eventi',
+        },
+      );
+    }
+    return c.json({ event: data }, 201);
+  },
+);
 
 /** PUT /events/:id — organizers only on their own events; staff on any. */
 events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), async (c) => {

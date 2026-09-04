@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole, optionalUser } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
-import { rateLimiter } from '../middleware/rateLimiter.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { assertRatingsEnabled } from './ratings.js';
 import { notify } from '../lib/notify.js';
 import {
@@ -34,7 +34,7 @@ const suggestions = new Hono();
  * rate-limited (spam guard). The drink appears in the catalog only after
  * staff approval.
  */
-suggestions.post('/', rateLimiter({ windowMs: 60_000, max: 5 }), async (c) => {
+suggestions.post('/', sharedRateLimiter({ windowMs: 60_000, max: 5, key: 'drink-suggestions' }), async (c) => {
   const body = createDrinkSuggestionSchema.parse(await c.req.json());
   const userId = await optionalUser(c);
 
@@ -90,7 +90,7 @@ suggestions.get('/', async (c) => {
  */
 suggestions.patch('/:id', async (c) => {
   const id = uuidParam(c);
-  const { status } = updateDrinkSuggestionSchema.parse(await c.req.json());
+  const { status, admin_note } = updateDrinkSuggestionSchema.parse(await c.req.json());
 
   const { data: sugg, error: loadErr } = await supabase
     .from('drink_suggestions')
@@ -122,13 +122,14 @@ suggestions.patch('/:id', async (c) => {
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Proposta non trovata');
 
   if (status === 'done' || status === 'rejected') {
+    const base =
+      status === 'done'
+        ? `"${sugg.name}" è entrato nel catalogo drink. Grazie!`
+        : `La tua proposta "${sugg.name}" non è stata accettata.`;
     await notify([sugg.created_by], {
       type: status === 'done' ? 'request_approved' : 'request_rejected',
       title: status === 'done' ? 'Drink approvato' : 'Proposta non accettata',
-      body:
-        status === 'done'
-          ? `"${sugg.name}" è entrato nel catalogo drink. Grazie!`
-          : `La tua proposta "${sugg.name}" non è stata accettata.`,
+      body: admin_note ? `${base}\n\n${admin_note}` : base,
       // Only when the insert actually created the row: on a duplicate name
       // there is no id to point at.
       link: drink?.id ? `/drink/${drink.id}` : null,

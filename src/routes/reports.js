@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
-import { rateLimiter } from '../middleware/rateLimiter.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
 import {
   createReportSchema,
@@ -20,7 +20,7 @@ const reports = new Hono();
  * POST /reports — submit a report. Auth required, strictly rate-limited
  * (spam guard, same budget as POST /suggestions).
  */
-reports.post('/', rateLimiter({ windowMs: 60_000, max: 5 }), requireAuth, async (c) => {
+reports.post('/', sharedRateLimiter({ windowMs: 60_000, max: 5, key: 'reports' }), requireAuth, async (c) => {
   const body = createReportSchema.parse(await c.req.json());
 
   const { data, error } = await supabase
@@ -68,7 +68,7 @@ reports.get('/', async (c) => {
 /** PATCH /reports/:id — set moderation status (new/done/rejected). */
 reports.patch('/:id', async (c) => {
   const id = uuidParam(c);
-  const { status } = updateReportSchema.parse(await c.req.json());
+  const { status, admin_note } = updateReportSchema.parse(await c.req.json());
   const { data, error } = await supabase
     .from('user_reports')
     .update({ status, updated_at: new Date().toISOString() })
@@ -81,13 +81,14 @@ reports.patch('/:id', async (c) => {
   // No link: a report has no page of its own, and the bell renders a row
   // without a chevron when there is nowhere to go.
   if (status === 'done' || status === 'rejected') {
+    const base =
+      status === 'done'
+        ? `La tua segnalazione (${data.type}) è stata presa in carico e risolta. Grazie!`
+        : `La tua segnalazione (${data.type}) è stata esaminata e archiviata senza interventi.`;
     await notify([data.created_by], {
       type: status === 'done' ? 'request_approved' : 'request_rejected',
       title: status === 'done' ? 'Segnalazione risolta' : 'Segnalazione archiviata',
-      body:
-        status === 'done'
-          ? `La tua segnalazione (${data.type}) è stata presa in carico e risolta. Grazie!`
-          : `La tua segnalazione (${data.type}) è stata esaminata e archiviata senza interventi.`,
+      body: admin_note ? `${base}\n\n${admin_note}` : base,
     });
   }
   return c.json({ report: { id: data.id, status: data.status } });

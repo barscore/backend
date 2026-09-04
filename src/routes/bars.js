@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
-import { rateLimiter } from '../middleware/rateLimiter.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import {
   nearbyQuerySchema,
   createBarSchema,
@@ -61,7 +61,7 @@ bars.get('/:id/drinks', async (c) => {
  * strict per-IP limit — browsing stays smooth, anonymous mass-creation of rows
  * doesn't (the global limiter alone would allow 120/min).
  */
-bars.post('/resolve', rateLimiter({ windowMs: 60_000, max: 30 }), async (c) => {
+bars.post('/resolve', sharedRateLimiter({ windowMs: 60_000, max: 30, key: 'bar-resolve' }), async (c) => {
   const body = resolveBarSchema.parse(await c.req.json());
 
   // Already persisted? Return it with full detail.
@@ -190,7 +190,7 @@ bars.get('/:id', async (c) => {
 bars.post(
   '/:id/claim',
   requireAuth,
-  rateLimiter({ windowMs: 60_000, max: 5 }),
+  sharedRateLimiter({ windowMs: 60_000, max: 5, key: 'bar-claim' }),
   async (c) => {
     const barId = uuidParam(c);
     const { proof_files, note } = createClaimSchema.parse(await c.req.json());

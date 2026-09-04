@@ -106,6 +106,54 @@ export async function applyBoost({ event_id, bar_id, tier, sponsor_radius_km }) 
   await supabase.from(table).update(update).eq('id', targetId);
 }
 
+/**
+ * New `boost_until` after taking `days` back off it. Subtracts instead of
+ * clearing because purchases stack (see applyBoost): whoever bought three
+ * boosts and got one refunded must keep the two he paid for.
+ *
+ * Anything landing in the past becomes null: queries all filter on
+ * `boost_until > NOW()`, so a stale date and null behave the same — null just
+ * reads better. Falsy `days` (unknown tier) means "nothing to take back".
+ *
+ * Pure on purpose: it is the only part of revokeBoost worth testing, and the
+ * self-check at the bottom of this file runs without a database.
+ */
+export function revokedUntil(currentUntil, days, now = new Date()) {
+  if (!days || !currentUntil) return currentUntil ?? null;
+  const until = new Date(new Date(currentUntil).getTime() - days * 86_400_000);
+  return until > now ? until.toISOString() : null;
+}
+
+/**
+ * Mirror image of applyBoost: takes the tier's days back off the target when a
+ * boost is refunded or charged back. Same table, same days, opposite sign.
+ *
+ * Called by the Stripe webhook on charge.refunded / charge.dispute.created;
+ * the caller is the one that keeps it idempotent (the order flips paid→refunded
+ * only once), so a redelivery can't strip the days twice.
+ */
+export async function revokeBoost({ event_id, bar_id, tier }) {
+  const days = TIERS[tier]?.days;
+  if (!days) return;
+
+  const table = event_id ? 'events' : 'bars';
+  const targetId = event_id ?? bar_id;
+
+  const { data: row } = await supabase
+    .from(table)
+    .select('boost_until')
+    .eq('id', targetId)
+    .maybeSingle();
+
+  const until = revokedUntil(row?.boost_until, days);
+  const update = { boost_until: until };
+  // The radius only goes away when the boost does: if stacked days survive the
+  // refund the bar is still sponsored, and it still needs its reach.
+  if (bar_id && until === null) update.sponsor_radius_km = null;
+
+  await supabase.from(table).update(update).eq('id', targetId);
+}
+
 // --- self-check: `SUPABASE_URL=http://localhost SUPABASE_SERVICE_ROLE_KEY=x node src/lib/boostFulfillment.js`
 if (import.meta.url === `file://${process.argv[1]}`) {
   const eq = (a, b, m) => {
@@ -117,5 +165,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   eq(radiusSurchargeCents(30, 50), Math.round(1.5 * 50 * 30), '30d / 50km');
   eq(radiusSurchargeCents(7, 999), radiusSurchargeCents(7, 50), 'radius capped at 50');
   eq(radiusSurchargeCents(7, 0.2), radiusSurchargeCents(7, 1), 'radius floored at 1');
+
+  const now = new Date('2026-01-10T00:00:00.000Z');
+  const at = (days) => new Date(now.getTime() + days * 86_400_000).toISOString();
+  eq(revokedUntil(at(3), 3, now), null, 'lone 3d boost revoked ⇒ null');
+  eq(revokedUntil(at(10), 3, now), at(7), 'stacked 3d+7d, 3d revoked ⇒ the 7d survives');
+  eq(revokedUntil(at(7), TIERS['1d']?.days, now), at(7), 'unknown tier ⇒ untouched');
+  eq(revokedUntil(at(-1), 3, now), null, 'already expired ⇒ null');
+  eq(revokedUntil(null, 3, now), null, 'no boost at all ⇒ null');
+
   console.log('boostFulfillment self-check ok');
 }

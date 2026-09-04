@@ -2,14 +2,18 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
-import { rateLimiter } from '../middleware/rateLimiter.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { isPlus } from '../lib/plus.js';
 import { myDrinkVotesQuerySchema } from '../schemas/drinkSchemas.js';
 import {
   createOrganizerRequestSchema,
   proofUploadSchema,
 } from '../schemas/organizerSchemas.js';
-import { assertOwnedPaths, createProofUploadUrls } from '../lib/proofs.js';
+import {
+  assertOwnedPaths,
+  createProofUploadUrls,
+  deleteAllProofsForUser,
+} from '../lib/proofs.js';
 
 // Account-scoped self routes. All require auth; a user only ever reads their own
 // profile and ratings. Credential changes go through supabase-js on the frontend.
@@ -57,7 +61,7 @@ me.get('/', async (c) => {
  */
 // 20/min e non 5 come le segnalazioni: un rewarded dura mezzo minuto, ma
 // dietro un NAT di rete mobile ci sono molti utenti sullo stesso IP.
-me.post('/rewarded', rateLimiter({ windowMs: 60_000, max: 20 }), async (c) => {
+me.post('/rewarded', sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'rewarded' }), async (c) => {
   const user = c.get('user');
 
   const { data, error } = await supabase.rpc('add_rewarded_view', { p_user: user.id });
@@ -109,7 +113,7 @@ me.get('/drink-votes', async (c) => {
  * The path is chosen here (under the caller's own folder), so a client cannot
  * write anywhere else in the bucket.
  */
-me.post('/uploads/proof', rateLimiter({ windowMs: 60_000, max: 20 }), async (c) => {
+me.post('/uploads/proof', sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'proof-upload' }), async (c) => {
   const user = c.get('user');
   const { files } = proofUploadSchema.parse(await c.req.json());
   const uploads = await createProofUploadUrls(
@@ -139,7 +143,7 @@ me.get('/organizer-request', async (c) => {
  * "proprietario" is not requestable here any more: that role comes from
  * claiming a bar on its own page (`POST /bars/:id/claim`).
  */
-me.post('/organizer-request', rateLimiter({ windowMs: 60_000, max: 5 }), async (c) => {
+me.post('/organizer-request', sharedRateLimiter({ windowMs: 60_000, max: 5, key: 'organizer-request' }), async (c) => {
   const user = c.get('user');
   if (user.role === 'organizer') {
     throw new AppError(409, 'CONFLICT', 'Sei già un organizzatore');
@@ -218,10 +222,87 @@ me.get('/events', async (c) => {
   });
 });
 
+/**
+ * GET /me/export — portabilità dei dati (art. 20 GDPR): tutto quello che
+ * l'utente ha prodotto in un unico JSON, scaricabile senza passare da noi.
+ *
+ * Degli allegati di verifica restano solo i nomi dei file: i documenti sono già
+ * suoi (li ha caricati lui) e il path interno non è un suo dato, è il modo in
+ * cui organizziamo il bucket. Il nome basta a sapere cosa era allegato a cosa.
+ *
+ * Limite stretto: la rotta apre otto query e serializza l'intera storia
+ * dell'account, non è una GET qualsiasi.
+ */
+me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' }), async (c) => {
+  const user = c.get('user');
+  const mine = (table, columns) => supabase.from(table).select(columns).eq('user_id', user.id);
+
+  const [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims] =
+    await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id, username, avatar_url, created_at, plus_until, rewarded_count')
+        .eq('id', user.id)
+        .maybeSingle(),
+      mine(
+        'ratings',
+        'id, bar_id, prezzo, qualita_drinks, socialita, varieta, orari, commento, created_at, updated_at, bars(id, name, address, city)',
+      ).order('created_at', { ascending: false }),
+      mine('drink_ratings', 'drink_id, bar_id, rating, created_at, updated_at'),
+      mine('bookmarks', 'bar_id, created_at'),
+      mine('follows', 'event_id, organizer_id, created_at'),
+      mine('notifications', 'type, title, body, link, read, created_at').order('created_at', {
+        ascending: false,
+      }),
+      mine(
+        'organizer_requests',
+        'id, requested_type, note, collaborations, status, admin_note, created_at, reviewed_at, proof_files',
+      ),
+      mine(
+        'bar_claims',
+        'id, bar_id, note, status, admin_note, created_at, reviewed_at, proof_files',
+      ),
+    ]);
+
+  // Un export incompleto spacciato per completo è peggio di un errore: se anche
+  // una sola query fallisce, fallisce tutto.
+  const parts = [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims];
+  if (parts.some((r) => r.error) || !profile.data) {
+    throw new AppError(500, 'INTERNAL_ERROR', 'Export non riuscito');
+  }
+
+  // `<user_id>/<uuid>.<ext>` → solo il nome del file.
+  const withFileNames = (rows) =>
+    rows.map((r) => ({ ...r, proof_files: (r.proof_files ?? []).map((f) => f.split('/').pop()) }));
+
+  // Senza questo header il browser mostra il JSON invece di salvarlo.
+  c.header('Content-Disposition', 'attachment; filename="rabar-dati.json"');
+  return c.json({
+    format_version: 1,
+    exported_at: new Date().toISOString(),
+    profile: { ...profile.data, email: user.email },
+    ratings: ratings.data ?? [],
+    drink_votes: drinkVotes.data ?? [],
+    bookmarks: bookmarks.data ?? [],
+    follows: follows.data ?? [],
+    notifications: notifications.data ?? [],
+    organizer_requests: withFileNames(requests.data ?? []),
+    claims: withFileNames(claims.data ?? []),
+  });
+});
+
 /** DELETE /me — the caller erases their own account (GDPR art. 17). Deleting the
  *  auth user cascades to profiles + ratings + votes (ON DELETE CASCADE). */
 me.delete('/', async (c) => {
   const user = c.get('user');
+
+  // Il cascade delle FK non arriva allo storage: senza questa riga i documenti
+  // d'identità e le visure allegati alle verifiche resterebbero nel bucket dopo
+  // una cancellazione chiesta dall'utente, cioè esattamente ciò che l'art. 17
+  // GDPR vieta. Best-effort: se lo storage fa i capricci l'account si cancella
+  // comunque (il fallimento viene loggato).
+  await deleteAllProofsForUser(user.id);
+
   const { error } = await supabase.auth.admin.deleteUser(user.id);
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Eliminazione account fallita');
   return c.json({ success: true });

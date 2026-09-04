@@ -5,7 +5,8 @@ import { AppError } from '../middleware/errorHandler.js';
 import { uuidParam } from '../schemas/common.js';
 import { reviewSchema } from '../schemas/organizerSchemas.js';
 import { notify } from '../lib/notify.js';
-import { signedProofUrls } from '../lib/proofs.js';
+import { audit } from '../lib/audit.js';
+import { deleteProofPaths, signedProofUrls } from '../lib/proofs.js';
 
 /**
  * Swap the stored storage paths for short-lived signed URLs, in one batch for
@@ -55,10 +56,12 @@ organizers.get('/requests', async (c) => {
 /** POST /admin/organizers/requests/:id/approve — grant the organizer role. */
 organizers.post('/requests/:id/approve', async (c) => {
   const id = uuidParam(c);
+  const { admin_note } = reviewSchema.parse(await c.req.json().catch(() => ({})));
   const { data: req, error } = await supabase
     .from('organizer_requests')
     .update({
       status: 'approved',
+      admin_note: admin_note ?? null,
       reviewed_by: c.get('user').id,
       reviewed_at: new Date().toISOString(),
     })
@@ -80,8 +83,15 @@ organizers.post('/requests/:id/approve', async (c) => {
   await notify([req.user_id], {
     type: 'request_approved',
     title: 'Richiesta approvata',
-    body: 'Il tuo account è ora un account organizzatore: puoi pubblicare eventi.',
+    body: admin_note
+      ? `Il tuo account è ora un account organizzatore: puoi pubblicare eventi.\n\n${admin_note}`
+      : 'Il tuo account è ora un account organizzatore: puoi pubblicare eventi.',
     link: '/?tab=eventi',
+  });
+  await audit(c.get('user').id, 'organizer_request.approve', {
+    targetType: 'organizer_request',
+    targetId: id,
+    payload: { user_id: req.user_id, requested_type: req.requested_type, admin_note: admin_note ?? null },
   });
   return c.json({ success: true });
 });
@@ -100,7 +110,7 @@ organizers.post('/requests/:id/reject', async (c) => {
     })
     .eq('id', id)
     .eq('status', 'pending')
-    .select('user_id')
+    .select('user_id, proof_files')
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Rifiuto non riuscito');
   if (!req) throw new AppError(404, 'NOT_FOUND', 'Richiesta non trovata o già gestita');
@@ -113,6 +123,17 @@ organizers.post('/requests/:id/reject', async (c) => {
       : 'La tua richiesta organizzatore è stata rifiutata. Puoi riprovare con prove più solide.',
     link: '/impostazioni',
   });
+  await audit(c.get('user').id, 'organizer_request.reject', {
+    targetType: 'organizer_request',
+    targetId: id,
+    payload: { user_id: req.user_id, admin_note: admin_note ?? null },
+  });
+  // Gli allegati di una richiesta respinta si cancellano: sono visure e
+  // documenti d'identità, e una richiesta chiusa in negativo non ha più motivo
+  // di tenerli (limitazione della conservazione, art. 5(1)(e) GDPR). Sugli
+  // approve restano invece: sono la prova della verifica, e servono se la
+  // decisione viene contestata.
+  await deleteProofPaths(req.proof_files);
   return c.json({ success: true });
 });
 
@@ -144,10 +165,12 @@ organizers.get('/claims', async (c) => {
 /** POST /admin/organizers/claims/:id/approve — set the bar's owner. */
 organizers.post('/claims/:id/approve', async (c) => {
   const id = uuidParam(c);
+  const { admin_note } = reviewSchema.parse(await c.req.json().catch(() => ({})));
   const { data: claim, error } = await supabase
     .from('bar_claims')
     .update({
       status: 'approved',
+      admin_note: admin_note ?? null,
       reviewed_by: c.get('user').id,
       reviewed_at: new Date().toISOString(),
     })
@@ -179,11 +202,17 @@ organizers.post('/claims/:id/approve', async (c) => {
     .in('role', ['user', 'betatester']);
   if (roleErr) throw new AppError(500, 'INTERNAL_ERROR', 'Aggiornamento ruolo non riuscito');
 
+  const claimApprovedBody = `Sei ora il proprietario verificato di "${bar.name}". Puoi mettere in evidenza il bar con un boost.`;
   await notify([claim.user_id], {
     type: 'claim_approved',
     title: 'Bar verificato',
-    body: `Sei ora il proprietario verificato di "${bar.name}". Puoi mettere in evidenza il bar con un boost.`,
+    body: admin_note ? `${claimApprovedBody}\n\n${admin_note}` : claimApprovedBody,
     link: `/bar/${claim.bar_id}`,
+  });
+  await audit(c.get('user').id, 'claim.approve', {
+    targetType: 'bar_claim',
+    targetId: id,
+    payload: { user_id: claim.user_id, bar_id: claim.bar_id, admin_note: admin_note ?? null },
   });
   return c.json({ success: true });
 });
@@ -202,7 +231,7 @@ organizers.post('/claims/:id/reject', async (c) => {
     })
     .eq('id', id)
     .eq('status', 'pending')
-    .select('user_id, bar_id')
+    .select('user_id, bar_id, proof_files')
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Rifiuto non riuscito');
   if (!claim) throw new AppError(404, 'NOT_FOUND', 'Richiesta non trovata o già gestita');
@@ -215,6 +244,13 @@ organizers.post('/claims/:id/reject', async (c) => {
       : 'La tua rivendicazione del bar è stata rifiutata.',
     link: `/bar/${claim.bar_id}`,
   });
+  await audit(c.get('user').id, 'claim.reject', {
+    targetType: 'bar_claim',
+    targetId: id,
+    payload: { user_id: claim.user_id, bar_id: claim.bar_id, admin_note: admin_note ?? null },
+  });
+  // Come per le richieste organizzatore: rifiutata, i documenti non servono più.
+  await deleteProofPaths(claim.proof_files);
   return c.json({ success: true });
 });
 

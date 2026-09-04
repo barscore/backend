@@ -22,4 +22,6 @@ export const listReportsQuerySchema = z.object({
 // Admin status change.
 export const updateReportSchema = z.object({
   status: z.enum(['new', 'done', 'rejected']),
+  // Nota facoltativa dello staff, mostrata all'utente nella notifica.
+  admin_note: z.string().trim().max(500).optional(),
 });

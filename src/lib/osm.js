@@ -1,3 +1,5 @@
+import { sanitizeHttpUrl } from './url.js';
+
 // Free OpenStreetMap data sources — no API key required.
 //   - Overpass API: query bars/pubs around a point
 //   - Nominatim:     geocode a free-text place/address
@@ -15,10 +17,13 @@ const OVERPASS_URLS = (process.env.OVERPASS_URL
       'https://overpass.private.coffee/api/interpreter',
       'https://overpass-api.de/api/interpreter',
       'https://overpass.kumi.systems/api/interpreter',
-      // mail.ru sometimes hangs for minutes — safe here because the race
-      // aborts losers; one extra healthy mirror matters from cloud IPs, which
-      // the public mirrors rate-limit far more aggressively than home IPs.
-      'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+      // A fourth mirror matters from cloud IPs, which the public mirrors
+      // rate-limit far more aggressively than home IPs — and a slow one is safe
+      // here because the race aborts the losers. It used to be maps.mail.ru;
+      // that sends the bbox built around the user's position to Russia (GDPR
+      // chapter V, no adequacy decision, sanctioned operator), so it is now the
+      // Swiss mirror — adequacy decision in place, and it holds up from cloud IPs.
+      'https://overpass.osm.ch/api/interpreter',
     ]);
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org';
 const UA = process.env.OSM_USER_AGENT || 'rabar/1.0 (https://github.com/rabar; contact: martino.parisi@rabar.it)';
@@ -26,8 +31,8 @@ const OVERPASS_TIMEOUT_MS = Number(process.env.OVERPASS_TIMEOUT_MS) || 20000;
 
 // Fire the query at every mirror simultaneously; resolve with the first 200.
 // Each attempt aborts on timeout; losers are aborted once a winner is found so
-// no hung connection (mail.ru-style 109s) leaks. Overpass accepts the raw
-// query as the POST body.
+// no hung connection (a sick mirror can sit there for 100s+) leaks. Overpass
+// accepts the raw query as the POST body.
 async function overpassFetch(query, timeoutMs = OVERPASS_TIMEOUT_MS) {
   const controllers = OVERPASS_URLS.map(() => new AbortController());
   const timers = [];
@@ -81,12 +86,15 @@ function mapElement(el) {
     lat,
     lng,
     phone: tags.phone || tags['contact:phone'] || null,
-    website: tags.website || tags['contact:website'] || null,
+    // Anyone can edit an OSM tag, so every URL leaving here is filtered to
+    // http(s) once, at the source — a `javascript:` website tag must never
+    // reach a caller that puts it in an href.
+    website: sanitizeHttpUrl(tags.website || tags['contact:website']),
     // Raw OSM opening_hours string. The client hides bars that close before
     // 23:00 local time (time-dependent, so NOT baked into the nearby cache).
     opening_hours: tags.opening_hours || null,
     // OSM occasionally carries an `image` tag (often a Wikimedia/Commons URL).
-    cover_image_url: tags.image || null,
+    cover_image_url: sanitizeHttpUrl(tags.image),
   };
 }
 

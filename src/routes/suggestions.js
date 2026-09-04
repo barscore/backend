@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole, optionalUser } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
-import { rateLimiter } from '../middleware/rateLimiter.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
 import {
   createSuggestionSchema,
@@ -20,7 +20,7 @@ const suggestions = new Hono();
  * POST /suggestions — submit a missing bar. Public, strictly rate-limited
  * (spam guard) since it needs no auth.
  */
-suggestions.post('/', rateLimiter({ windowMs: 60_000, max: 5 }), async (c) => {
+suggestions.post('/', sharedRateLimiter({ windowMs: 60_000, max: 5, key: 'suggestions' }), async (c) => {
   const body = createSuggestionSchema.parse(await c.req.json());
   const userId = await optionalUser(c);
 
@@ -77,7 +77,7 @@ suggestions.get('/', async (c) => {
 /** PATCH /suggestions/:id — set moderation status (new/done/rejected). */
 suggestions.patch('/:id', async (c) => {
   const id = uuidParam(c);
-  const { status } = updateSuggestionSchema.parse(await c.req.json());
+  const { status, admin_note } = updateSuggestionSchema.parse(await c.req.json());
   const { data, error } = await supabase
     .from('bar_suggestions')
     .update({ status, updated_at: new Date().toISOString() })
@@ -90,13 +90,14 @@ suggestions.patch('/:id', async (c) => {
   // The lead can be submitted signed out, in which case there is nobody to
   // tell — notify() drops the empty id.
   if (status === 'done' || status === 'rejected') {
+    const base =
+      status === 'done'
+        ? `"${data.name}" è stato aggiunto a rabar. Grazie per la segnalazione!`
+        : `La segnalazione per "${data.name}" non è stata accettata.`;
     await notify([data.created_by], {
       type: status === 'done' ? 'request_approved' : 'request_rejected',
       title: status === 'done' ? 'Segnalazione accettata' : 'Segnalazione non accettata',
-      body:
-        status === 'done'
-          ? `"${data.name}" è stato aggiunto a rabar. Grazie per la segnalazione!`
-          : `La segnalazione per "${data.name}" non è stata accettata.`,
+      body: admin_note ? `${base}\n\n${admin_note}` : base,
     });
   }
   return c.json({ suggestion: { id: data.id, status: data.status } });

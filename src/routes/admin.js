@@ -3,6 +3,8 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { audit } from '../lib/audit.js';
+import { notify } from '../lib/notify.js';
 import {
   listUsersQuerySchema,
   suspendSchema,
@@ -17,6 +19,10 @@ import {
 // service-role key, so these bypass RLS.
 const admin = new Hono();
 admin.use('*', requireAuth, requireRole('admin'));
+
+// Indirizzo dei reclami, lo stesso pubblicato nei ToS: ogni motivazione DSA
+// deve dire dove si contesta la decisione.
+const CONTATTO_RECLAMI = 'abuse@rabar.it';
 
 // Common moderation-column patch (who/when).
 function stamp(actorId) {
@@ -120,9 +126,16 @@ function assertNotSelf(c, targetId) {
   }
 }
 
+// Restituisce la riga: chi chiama ha spesso bisogno dello stato *prima*
+// dell'azione (il ruolo che si sta cambiando) per l'audit.
 async function assertUserExists(id) {
-  const { data } = await supabase.from('profiles').select('id').eq('id', id).maybeSingle();
+  const { data } = await supabase
+    .from('profiles')
+    .select('id, role')
+    .eq('id', id)
+    .maybeSingle();
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Utente non trovato');
+  return data;
 }
 
 /** POST /admin/users/:id/ban — permanent ban (locked out until unbanned). */
@@ -144,6 +157,21 @@ admin.post('/users/:id/ban', async (c) => {
     .select('id, banned')
     .single();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Ban fallito');
+
+  // DSA art. 17: la restrizione va motivata a chi la subisce, indicando dove
+  // contestarla. Un bannato non supera più requireAuth e quindi non vedrà mai la
+  // campanella — la riga resta per il ricorso, a consegnarla è il Web Push.
+  await notify([id], {
+    type: 'account_restricted',
+    title: 'Account bloccato',
+    body: `${reason ? `Il tuo account è stato bloccato: ${reason}.` : "Il tuo account è stato bloccato per violazione delle condizioni d'uso."} Puoi contestare la decisione scrivendo a ${CONTATTO_RECLAMI}.`,
+    link: '/tos',
+  });
+  await audit(c.get('user').id, 'user.ban', {
+    targetType: 'user',
+    targetId: id,
+    payload: { reason: reason ?? null },
+  });
   return c.json({ user: data });
 });
 
@@ -167,6 +195,21 @@ admin.post('/users/:id/suspend', async (c) => {
     .select('id, suspended_until')
     .single();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Sospensione fallita');
+
+  // Stessa motivazione DSA del ban, più la scadenza: una sospensione senza data
+  // di fine non è una sospensione, è un ban che non lo dice.
+  const fino = new Date(until).toLocaleString('it-IT');
+  await notify([id], {
+    type: 'account_restricted',
+    title: 'Account sospeso',
+    body: `${reason ? `Il tuo account è sospeso fino al ${fino}: ${reason}.` : `Il tuo account è sospeso fino al ${fino}.`} Puoi contestare la decisione scrivendo a ${CONTATTO_RECLAMI}.`,
+    link: '/tos',
+  });
+  await audit(c.get('user').id, 'user.suspend', {
+    targetType: 'user',
+    targetId: id,
+    payload: { hours, until, reason: reason ?? null },
+  });
   return c.json({ user: data });
 });
 
@@ -187,6 +230,10 @@ admin.post('/users/:id/unban', async (c) => {
     .select('id')
     .single();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Sblocco fallito');
+
+  // Nessuna notifica: lo sblocco non è una restrizione da motivare, e l'utente
+  // se ne accorge rientrando. Nell'audit ci va lo stesso, chiude la coppia.
+  await audit(c.get('user').id, 'user.unban', { targetType: 'user', targetId: id });
   return c.json({ user: data });
 });
 
@@ -194,7 +241,7 @@ admin.post('/users/:id/unban', async (c) => {
 admin.put('/users/:id/role', async (c) => {
   const id = uuidParam(c);
   assertNotSelf(c, id);
-  await assertUserExists(id);
+  const before = await assertUserExists(id);
   const { role, organizer_type } = roleSchema.parse(await c.req.json());
 
   const { data, error } = await supabase
@@ -209,6 +256,12 @@ admin.put('/users/:id/role', async (c) => {
     .select('id, role, organizer_type')
     .single();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Cambio ruolo fallito');
+
+  await audit(c.get('user').id, 'user.role', {
+    targetType: 'user',
+    targetId: id,
+    payload: { from: before.role, to: role, organizer_type: data.organizer_type },
+  });
   return c.json({ user: data });
 });
 
@@ -216,11 +269,19 @@ admin.put('/users/:id/role', async (c) => {
 admin.delete('/users/:id', async (c) => {
   const id = uuidParam(c);
   assertNotSelf(c, id);
-  await assertUserExists(id);
+  const before = await assertUserExists(id);
 
   // Deleting the auth user cascades to profiles + ratings (ON DELETE CASCADE).
   const { error } = await supabase.auth.admin.deleteUser(id);
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Eliminazione account fallita');
+
+  // Il ruolo cancellato è l'unica traccia che resta di chi era: la riga profilo
+  // non c'è più e il target_id da solo non dice nulla a chi rilegge il log.
+  await audit(c.get('user').id, 'user.delete', {
+    targetType: 'user',
+    targetId: id,
+    payload: { role: before.role },
+  });
   return c.json({ success: true });
 });
 
@@ -263,14 +324,29 @@ admin.get('/ratings', async (c) => {
 /** DELETE /admin/ratings/:id — remove any rating. */
 admin.delete('/ratings/:id', async (c) => {
   const id = uuidParam(c);
+  // Autore e bar arrivano dal RETURNING: dopo la DELETE non c'è più modo di
+  // sapere a chi va motivata la rimozione.
   const { data, error } = await supabase
     .from('ratings')
     .delete()
     .eq('id', id)
-    .select('id')
+    .select('id, user_id, bar_id')
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete rating');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Valutazione non trovata');
+
+  // DSA art. 17: la rimozione di un contenuto va motivata al suo autore.
+  await notify([data.user_id], {
+    type: 'content_removed',
+    title: 'Valutazione rimossa',
+    body: `La tua valutazione è stata rimossa perché non rispetta le condizioni d'uso. Puoi contestare la decisione scrivendo a ${CONTATTO_RECLAMI}.`,
+    link: `/bar/${data.bar_id}`,
+  });
+  await audit(c.get('user').id, 'rating.delete', {
+    targetType: 'rating',
+    targetId: id,
+    payload: { user_id: data.user_id, bar_id: data.bar_id },
+  });
   return c.json({ success: true });
 });
 
@@ -299,6 +375,11 @@ admin.put('/settings', async (c) => {
     .select('registration_open, ratings_enabled, maintenance_mode, maintenance_reason, maintenance_eta, beta_mode, updated_at')
     .single();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update settings');
+
+  await audit(c.get('user').id, 'settings.update', {
+    targetType: 'app_settings',
+    payload: patch,
+  });
   return c.json({ settings: data });
 });
 
@@ -316,7 +397,14 @@ admin.post('/emergency/purge-user-ratings/:id', async (c) => {
     .eq('user_id', id)
     .select('id');
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Purge fallito');
-  return c.json({ success: true, deleted: data?.length ?? 0 });
+
+  const deleted = data?.length ?? 0;
+  await audit(c.get('user').id, 'emergency.purge_ratings', {
+    targetType: 'user',
+    targetId: id,
+    payload: { deleted },
+  });
+  return c.json({ success: true, deleted });
 });
 
 export default admin;

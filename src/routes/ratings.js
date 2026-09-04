@@ -126,14 +126,11 @@ ratings.delete('/:rid', requireAuth, async (c) => {
   if (!existing) throw new AppError(404, 'NOT_FOUND', 'Rating not found');
 
   // Owners delete their own; admins delete any (inappropriate) rating.
-  if (existing.user_id !== user.id) {
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', user.id)
-      .maybeSingle();
-    if (profile?.role !== 'admin')
-      throw new AppError(403, 'FORBIDDEN', 'Not your rating');
+  // Il ruolo è già su context: requireAuth tocca comunque `profiles` per il
+  // controllo del ban e lo lascia lì apposta (middleware/auth.js:40), quindi
+  // rileggerlo qui era un secondo giro al database per lo stesso dato.
+  if (existing.user_id !== user.id && user.role !== 'admin') {
+    throw new AppError(403, 'FORBIDDEN', 'Not your rating');
   }
 
   const { error } = await supabase.from('ratings').delete().eq('id', rid);

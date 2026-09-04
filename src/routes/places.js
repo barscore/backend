@@ -135,10 +135,16 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
  * by enrichWithRatings), it isn't added twice.
  */
 async function nearbySponsoredExtras(lat, lng, haveOsm, haveId) {
-  const { data } = await supabase
+  // NB: niente `osm_type` nella select — quella colonna su `bars` non esiste e
+  // non è mai esistita (nessuna migrazione la crea). Chiederla faceva fallire
+  // l'INTERA query con 42703, e siccome l'errore non veniva letto la funzione
+  // restituiva una lista vuota: il raggio di visibilità, che è a pagamento, non
+  // ha mai iniettato un solo bar sulla mappa. `osm_type` lo mettiamo nella
+  // forma di uscita più sotto, dove serve davvero.
+  const { data, error } = await supabase
     .from('bars')
     .select(
-      'id, osm_node_id, osm_type, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url, sponsor_radius_km, bar_ratings_summary(avg_overall, total_ratings)',
+      'id, osm_node_id, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url, sponsor_radius_km, bar_ratings_summary(avg_overall, total_ratings)',
     )
     .eq('is_active', true)
     .gt('boost_until', new Date().toISOString())
@@ -147,10 +153,22 @@ async function nearbySponsoredExtras(lat, lng, haveOsm, haveId) {
     // node can't ride this list (it also has no map pin).
     .not('osm_node_id', 'is', null);
 
+  // Rumoroso, non silenzioso: qui si consegna merce pagata, e una lista vuota è
+  // indistinguibile da "nessuno ha comprato un boost". È il motivo per cui il
+  // bug è passato inosservato — /nearby continuava a rispondere 200.
+  if (error) {
+    console.error('[places] sponsored extras non caricati:', error.message);
+    return [];
+  }
+
   return (data ?? [])
     .filter((b) => !haveId.has(b.id) && !haveOsm.has(String(b.osm_node_id)))
     .map((b) => ({
       ...b,
+      // I luoghi da Overpass portano osm_type; questi vengono dal database, che
+      // non lo memorizza. 'node' è il default che assume anche il client
+      // (utils/score.js#barKey) e lo stesso di resolveBarSchema.
+      osm_type: 'node',
       distance_km: Math.round(haversineKm(lat, lng, b.lat, b.lng) * 100) / 100,
       avg_overall: b.bar_ratings_summary?.avg_overall ?? 0,
       total_ratings: b.bar_ratings_summary?.total_ratings ?? 0,
