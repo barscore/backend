@@ -17,13 +17,6 @@ const OVERPASS_URLS = (process.env.OVERPASS_URL
       'https://overpass.private.coffee/api/interpreter',
       'https://overpass-api.de/api/interpreter',
       'https://overpass.kumi.systems/api/interpreter',
-      // A fourth mirror matters from cloud IPs, which the public mirrors
-      // rate-limit far more aggressively than home IPs — and a slow one is safe
-      // here because the race aborts the losers. It used to be maps.mail.ru;
-      // that sends the bbox built around the user's position to Russia (GDPR
-      // chapter V, no adequacy decision, sanctioned operator), so it is now the
-      // Swiss mirror — adequacy decision in place, and it holds up from cloud IPs.
-      'https://overpass.osm.ch/api/interpreter',
     ]);
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org';
 const UA = process.env.OSM_USER_AGENT || 'rabar/1.0 (https://github.com/rabar; contact: martino.parisi@rabar.it)';
