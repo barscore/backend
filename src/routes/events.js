@@ -217,4 +217,28 @@ events.delete('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'
   return c.json({ success: true });
 });
 
+
+/** POST /events/verify-entry — organizers checking user QR code for party entry */
+events.post('/verify-entry', requireAuth, requireRole('organizer', 'admin', 'moderator'), async (c) => {
+  const { user_id } = await c.req.json();
+  if (!user_id) throw new AppError(400, 'BAD_REQUEST', 'ID utente mancante');
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('id, username, banned, suspended_until')
+    .eq('id', user_id)
+    .maybeSingle();
+
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Errore database');
+  if (!profile) throw new AppError(404, 'NOT_FOUND', 'Utente non trovato');
+
+  if (profile.banned) {
+    throw new AppError(403, 'FORBIDDEN', 'Utente bannato: ingresso negato');
+  }
+  if (profile.suspended_until && new Date(profile.suspended_until) > new Date()) {
+    throw new AppError(403, 'FORBIDDEN', 'Utente in timeout: ingresso negato');
+  }
+
+  return c.json({ success: true, user: { id: profile.id, username: profile.username } });
+});
 export default events;
