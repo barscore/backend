@@ -9,7 +9,7 @@ import { isPlus } from '../lib/plus.js';
 const users = new Hono();
 
 const PUBLIC_COLS =
-  'id, username, avatar_url, role, organizer_type, created_at, plus_until';
+  'id, username, avatar_url, role, organizer_type, created_at, plus_until, is_explorer';
 
 /** Public shape: the rabar+ badge is public, the exact expiry is not. */
 const toPublic = (p) => ({ ...p, plus: isPlus(p), plus_until: undefined });

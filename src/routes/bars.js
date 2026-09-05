@@ -219,6 +219,31 @@ bars.post(
   },
 );
 
+/**
+ * POST /bars/redeem-drink — bar owners can redeem a user's free drink token.
+ */
+bars.post(
+  '/redeem-drink',
+  requireAuth,
+  async (c) => {
+    const user = c.get('user');
+    const { token } = await c.req.json();
+    if (!token) throw new AppError(400, 'BAD_REQUEST', 'Token mancante');
+
+    const { data: ownedBars } = await supabase.from('bars').select('id, name').eq('owner_id', user.id);
+    if (!ownedBars || ownedBars.length === 0) throw new AppError(403, 'FORBIDDEN', 'Non sei il proprietario di alcun bar');
+
+    // Trova l'utente col token
+    const { data: profile } = await supabase.from('profiles').select('id').eq('free_drink_token', token).maybeSingle();
+    if (!profile) throw new AppError(404, 'NOT_FOUND', 'Codice non valido o già utilizzato');
+
+    const { error } = await supabase.from('profiles').update({ free_drink_token: null }).eq('id', profile.id);
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Errore durante il riscatto');
+
+    return c.json({ success: true });
+  }
+);
+
 /** POST /bars — create (admin/moderator only). */
 bars.post('/', requireAuth, requireRole('admin', 'moderator'), async (c) => {
   const body = createBarSchema.parse(await c.req.json());

@@ -254,4 +254,32 @@ organizers.post('/claims/:id/reject', async (c) => {
   return c.json({ success: true });
 });
 
+/** POST /admin/organizers/claims/:id/revoke - revoke bar ownership */
+organizers.post('/claims/:id/revoke', async (c) => {
+  const id = uuidParam(c);
+  const { data: claim, error } = await supabase
+    .from('bar_claims')
+    .update({
+      status: 'rejected',
+      admin_note: 'Proprietà revocata',
+      reviewed_by: c.get('user').id,
+      reviewed_at: new Date().toISOString(),
+    })
+    .eq('id', id)
+    .eq('status', 'approved')
+    .select('user_id, bar_id')
+    .maybeSingle();
+
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Revoca non riuscita');
+  if (!claim) throw new AppError(404, 'NOT_FOUND', 'Richiesta non trovata o non approvata');
+
+  await supabase
+    .from('bars')
+    .update({ owner_id: null })
+    .eq('id', claim.bar_id)
+    .eq('owner_id', claim.user_id);
+
+  return c.json({ success: true });
+});
+
 export default organizers;

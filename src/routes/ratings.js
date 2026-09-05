@@ -42,7 +42,7 @@ ratings.get('/', async (c) => {
 
   const { data, error, count } = await supabase
     .from('ratings')
-    .select('id, prezzo, qualita_drinks, socialita, varieta, orari, commento, created_at, profiles(username, avatar_url, plus_until)', {
+    .select('id, prezzo, qualita_drinks, socialita, varieta, orari, commento, created_at, profiles(username, avatar_url, plus_until, is_explorer)', {
       count: 'exact',
     })
     .eq('bar_id', barId)
@@ -54,7 +54,7 @@ ratings.get('/', async (c) => {
   const ratingsOut = (data ?? []).map((r) => ({
     ...r,
     profiles: r.profiles
-      ? { username: r.profiles.username, avatar_url: r.profiles.avatar_url, plus: isPlus(r.profiles) }
+      ? { username: r.profiles.username, avatar_url: r.profiles.avatar_url, plus: isPlus(r.profiles), is_explorer: r.profiles.is_explorer }
       : null,
   }));
   return c.json({ ratings: ratingsOut, page, limit, total: count ?? 0 });

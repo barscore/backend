@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import crypto from 'node:crypto';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
@@ -26,7 +27,7 @@ me.get('/', async (c) => {
 
   const { data: profile, error } = await supabase
     .from('profiles')
-    .select('id, username, avatar_url, created_at, plus_until, rewarded_count')
+    .select('id, username, avatar_url, created_at, plus_until, rewarded_count, is_explorer, free_drink_token')
     .eq('id', user.id)
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load profile');
@@ -121,6 +122,44 @@ me.post('/uploads/proof', sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'p
     files.map((f) => f.ext),
   );
   return c.json({ uploads });
+});
+
+me.post('/promo', async (c) => {
+  const user = c.get('user');
+  const { promo } = await c.req.json();
+  if (promo !== 'explorer') return c.json({ success: true });
+
+  // The profile row is created by the handle_new_user trigger after signUp.
+  // On a fresh registration the trigger may not have finished yet, so we
+  // retry a few times before giving up.
+  let current = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { data } = await supabase
+      .from('profiles')
+      .select('is_explorer, free_drink_token')
+      .eq('id', user.id)
+      .maybeSingle();
+    if (data) { current = data; break; }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  if (!current) {
+    throw new AppError(404, 'PROFILE_NOT_READY', 'Profile row not found yet — retry later');
+  }
+
+  if (!current.is_explorer && !current.free_drink_token) {
+    const { error: upErr } = await supabase
+      .from('profiles')
+      .update({
+        is_explorer: true,
+        free_drink_token: crypto.randomUUID(),
+      })
+      .eq('id', user.id);
+    if (upErr) {
+      throw new AppError(500, 'INTERNAL_ERROR', 'Could not apply promo');
+    }
+  }
+  return c.json({ success: true });
 });
 
 /** GET /me/organizer-request — latest upgrade request (or null). */
