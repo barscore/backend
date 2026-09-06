@@ -27,7 +27,7 @@ me.get('/', async (c) => {
 
   const { data: profile, error } = await supabase
     .from('profiles')
-    .select('id, username, avatar_url, created_at, plus_until, rewarded_count, is_explorer, free_drink_token')
+    .select('id, username, avatar_url, instagram_username, whatsapp_number, created_at, plus_until, rewarded_count, is_explorer, free_drink_token')
     .eq('id', user.id)
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load profile');
@@ -50,6 +50,28 @@ me.get('/', async (c) => {
       plus: isPlus(profile),
     },
   });
+});
+
+/** PATCH /me — update profile details (Instagram, WhatsApp, etc). */
+me.patch('/', async (c) => {
+  const user = c.get('user');
+  const { updateProfileSchema } = await import('../schemas/userSchemas.js');
+  const body = updateProfileSchema.parse(await c.req.json());
+  
+  const { data, error } = await supabase
+    .from('profiles')
+    .update(body)
+    .eq('id', user.id)
+    .select('id, username, avatar_url, instagram_username, whatsapp_number, created_at, plus_until')
+    .single();
+    
+  if (error) {
+    if (error.code === '23505' && error.message.includes('username')) {
+      throw new AppError(409, 'CONFLICT', 'Questo username è già in uso');
+    }
+    throw new AppError(500, 'INTERNAL_ERROR', 'Could not update profile');
+  }
+  return c.json({ profile: data });
 });
 
 /** POST /me/rewarded — one AdMob rewarded ad watched to the end. Increments the
@@ -147,19 +169,38 @@ me.post('/promo', async (c) => {
     throw new AppError(404, 'PROFILE_NOT_READY', 'Profile row not found yet — retry later');
   }
 
-  if (!current.is_explorer && !current.free_drink_token) {
+  const { count } = await supabase
+    .from('ratings')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', user.id);
+
+  const ratingsCount = count ?? 0;
+  let is_new = false;
+
+  if (!current.is_explorer) {
     const { error: upErr } = await supabase
       .from('profiles')
-      .update({
-        is_explorer: true,
-        free_drink_token: crypto.randomUUID(),
-      })
+      .update({ is_explorer: true })
       .eq('id', user.id);
-    if (upErr) {
-      throw new AppError(500, 'INTERNAL_ERROR', 'Could not apply promo');
-    }
+    if (upErr) throw new AppError(500, 'INTERNAL_ERROR', 'Could not apply promo');
+    is_new = true;
   }
-  return c.json({ success: true });
+
+  if (ratingsCount >= 5 && !current.free_drink_token) {
+    const { error: upErr } = await supabase
+      .from('profiles')
+      .update({ free_drink_token: crypto.randomUUID() })
+      .eq('id', user.id);
+    if (upErr) throw new AppError(500, 'INTERNAL_ERROR', 'Could not generate token');
+  }
+
+  return c.json({
+    success: true,
+    promo: 'explorer',
+    is_new,
+    ratings_count: ratingsCount,
+    has_token: ratingsCount >= 5 || !!current.free_drink_token
+  });
 });
 
 /** GET /me/organizer-request — latest upgrade request (or null). */
@@ -244,7 +285,7 @@ me.get('/events', async (c) => {
   const { data, error } = await supabase
     .from('events')
     .select(
-      'id, bar_id, title, description, lat, lng, starts_at, ends_at, cancelled_at, boost_until, bars(name)',
+      'id, bar_id, title, description, lat, lng, starts_at, ends_at, cancelled_at, boost_until, has_presales, photo_url, free_drink, bars(name)',
     )
     .eq('created_by', user.id)
     .order('starts_at', { ascending: false })

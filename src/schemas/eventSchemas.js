@@ -18,6 +18,9 @@ export const createEventSchema = z
     lng: z.number().min(-180).max(180).optional(),
     starts_at: z.string().datetime({ offset: true }),
     ends_at: z.string().datetime({ offset: true }).optional(),
+    has_presales: z.boolean().optional().default(false),
+    photo_url: z.string().url().max(1000).optional().nullable(),
+    free_drink: z.boolean().optional().default(false),
   })
   .refine((e) => e.bar_id || (e.lat != null && e.lng != null), {
     message: 'Provide bar_id or lat/lng',
@@ -35,5 +38,8 @@ export const updateEventSchema = z
     lng: z.number().min(-180).max(180).optional(),
     starts_at: z.string().datetime({ offset: true }).optional(),
     ends_at: z.string().datetime({ offset: true }).optional().nullable(),
+    has_presales: z.boolean().optional(),
+    photo_url: z.string().url().max(1000).optional().nullable(),
+    free_drink: z.boolean().optional(),
   })
   .refine((e) => Object.keys(e).length > 0, { message: 'Empty update' });

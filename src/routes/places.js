@@ -100,7 +100,7 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
     const wanted = new Set(osmPlaces.map((p) => String(p.osm_node_id)));
     const { data } = await supabase
       .from('bars')
-      .select('id, osm_node_id, boost_until, bar_ratings_summary(avg_overall, total_ratings)')
+      .select('id, osm_node_id, accepts_free_drinks, free_drinks_hours, boost_until, bar_ratings_summary(avg_overall, total_ratings)')
       .not('osm_node_id', 'is', null)
       .limit(10000);
     byOsm = new Map(
@@ -115,6 +115,8 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
     return {
       ...p,
       id: match?.id ?? null,
+      accepts_free_drinks: match?.accepts_free_drinks ?? false,
+      free_drinks_hours: match?.free_drinks_hours ?? null,
       avg_overall: match?.bar_ratings_summary?.avg_overall ?? 0,
       total_ratings: match?.bar_ratings_summary?.total_ratings ?? 0,
       sponsored: !!match?.boost_until && new Date(match.boost_until).getTime() > now,
@@ -144,7 +146,7 @@ async function nearbySponsoredExtras(lat, lng, haveOsm, haveId) {
   const { data, error } = await supabase
     .from('bars')
     .select(
-      'id, osm_node_id, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url, sponsor_radius_km, bar_ratings_summary(avg_overall, total_ratings)',
+      'id, osm_node_id, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url, sponsor_radius_km, accepts_free_drinks, free_drinks_hours, bar_ratings_summary(avg_overall, total_ratings)',
     )
     .eq('is_active', true)
     .gt('boost_until', new Date().toISOString())

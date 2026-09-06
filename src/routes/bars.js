@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { uuidParam } from '../schemas/common.js';
 import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
@@ -14,7 +15,7 @@ import {
 import { listTopQuerySchema } from '../schemas/drinkSchemas.js';
 import { createClaimSchema } from '../schemas/organizerSchemas.js';
 import { assertOwnedPaths } from '../lib/proofs.js';
-import { fetchElement } from '../lib/osm.js';
+import { fetchElement, reverseGeocode } from '../lib/osm.js';
 import ratings from './ratings.js';
 
 const bars = new Hono();
@@ -23,6 +24,28 @@ const BAR_DETAIL_SELECT = '*, bar_ratings_summary(*), bar_images(id, url, source
 
 // Nested ratings routes: /bars/:id/ratings...
 bars.route('/:id/ratings', ratings);
+
+/** GET /bars/free-drinks — list bars that accept free drinks within radius. */
+bars.get('/free-drinks', async (c) => {
+  const { lat, lng, radius_km } = nearbyQuerySchema.parse(
+    Object.fromEntries(new URL(c.req.url).searchParams),
+  );
+
+  if (lat === undefined || lng === undefined) {
+    throw new AppError(400, 'BAD_REQUEST', 'Missing coordinates');
+  }
+
+  const { data, error } = await supabase.rpc('get_nearby_bars', {
+    user_lat: lat,
+    user_lng: lng,
+    radius_km: radius_km || 30,
+  });
+
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Nearby query failed');
+  
+  const acceptingBars = (data ?? []).filter(b => b.accepts_free_drinks);
+  return c.json({ bars: acceptingBars });
+});
 
 /** GET /bars/:id/drinks — the best drinks at this bar (trigger-maintained summary). */
 bars.get('/:id/drinks', async (c) => {
@@ -82,6 +105,18 @@ bars.post('/resolve', sharedRateLimiter({ windowMs: 60_000, max: 30, key: 'bar-r
   }
   if (info.lat == null || info.lng == null)
     throw new AppError(422, 'VALIDATION_ERROR', 'Missing coordinates for bar');
+
+  if (!info.address) {
+    try {
+      const geo = await reverseGeocode(info.lat, info.lng);
+      if (geo) {
+        info.address = geo.address;
+        info.city = info.city || geo.city;
+      }
+    } catch (e) {
+      console.error('Reverse geocode failed:', e);
+    }
+  }
 
   const insert = {
     name: (info.name || 'Senza nome').slice(0, 100),
@@ -240,6 +275,47 @@ bars.post(
     const { error } = await supabase.from('profiles').update({ free_drink_token: null }).eq('id', profile.id);
     if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Errore durante il riscatto');
 
+    return c.json({ success: true });
+  }
+);
+
+/**
+ * PATCH /bars/:id/free-drinks — bar owners can update their free drink settings
+ */
+bars.patch(
+  '/:id/free-drinks',
+  requireAuth,
+  async (c) => {
+    const id = uuidParam(c);
+    const user = c.get('user');
+    const body = z.object({
+      accepts_free_drinks: z.boolean(),
+      free_drinks_hours: z.string().nullable().optional()
+    }).parse(await c.req.json());
+
+    const { data: bar, error: barErr } = await supabase
+      .from('bars')
+      .select('owner_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (barErr) throw new AppError(500, 'INTERNAL_ERROR', 'Errore durante la verifica');
+    if (!bar) throw new AppError(404, 'NOT_FOUND', 'Bar non trovato');
+    
+    if (bar.owner_id !== user.id && user.role !== 'admin' && user.role !== 'moderator') {
+      throw new AppError(403, 'FORBIDDEN', 'Solo il proprietario può modificare queste impostazioni');
+    }
+
+    const { error } = await supabase
+      .from('bars')
+      .update({
+        accepts_free_drinks: body.accepts_free_drinks,
+        free_drinks_hours: body.free_drinks_hours ?? null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Errore durante il salvataggio');
     return c.json({ success: true });
   }
 );

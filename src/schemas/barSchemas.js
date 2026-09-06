@@ -23,6 +23,8 @@ export const createBarSchema = z.object({
 
 export const updateBarSchema = createBarSchema.partial().extend({
   is_active: z.boolean().optional(),
+  accepts_free_drinks: z.boolean().optional(),
+  free_drinks_hours: z.string().nullable().optional(),
 });
 
 // Lives in lib/url.js now — lib/osm.js sanitizes the raw OSM tags too, and a

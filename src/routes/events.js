@@ -36,7 +36,7 @@ events.get('/', async (c) => {
   const { data, error } = await supabase
     .from('events')
     .select(
-      'id, bar_id, title, description, lat, lng, starts_at, ends_at, boost_until, created_by, bars(name), profiles!events_created_by_fkey(username, role)',
+      'id, bar_id, title, description, lat, lng, starts_at, ends_at, boost_until, created_by, has_presales, photo_url, free_drink, bars(name), profiles!events_created_by_fkey(username, role)',
     )
     .is('cancelled_at', null)
     .gte('starts_at', new Date().toISOString())
@@ -54,6 +54,9 @@ events.get('/', async (c) => {
     lng: e.lng,
     starts_at: e.starts_at,
     ends_at: e.ends_at,
+    has_presales: e.has_presales,
+    photo_url: e.photo_url,
+    free_drink: e.free_drink,
     bar_name: e.bars?.name ?? null,
     organizer_id: e.profiles?.role === 'organizer' ? e.created_by : null,
     organizer_username: e.profiles?.role === 'organizer' ? e.profiles.username : null,
@@ -62,6 +65,51 @@ events.get('/', async (c) => {
   // Stable sort: sponsored first, starts_at order preserved within each group.
   flattened.sort((a, b) => b.sponsored - a.sponsored);
   return c.json({ events: flattened });
+});
+
+/** GET /events/:id — fetch a single event by ID. */
+events.get('/:id', async (c) => {
+  const id = uuidParam(c);
+  const { data, error } = await supabase
+    .from('events')
+    .select(
+      'id, bar_id, title, description, lat, lng, starts_at, ends_at, boost_until, created_by, has_presales, photo_url, free_drink, bars(name), profiles!events_created_by_fkey(username, role)',
+    )
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load event');
+  if (!data) throw new AppError(404, 'NOT_FOUND', 'Event not found');
+
+  const now = Date.now();
+  const event = {
+    ...data,
+    bar_name: data.bars?.name ?? null,
+    organizer_id: data.profiles?.role === 'organizer' ? data.created_by : null,
+    organizer_username: data.profiles?.role === 'organizer' ? data.profiles.username : null,
+    sponsored: !!data.boost_until && new Date(data.boost_until).getTime() > now,
+  };
+  return c.json({ event });
+});
+
+/** GET /events/:id/prs — list PRs assigned to an event. */
+events.get('/:id/prs', async (c) => {
+  const id = uuidParam(c);
+  const { data, error } = await supabase
+    .from('event_prs')
+    .select('pr_id, profiles!event_prs_pr_id_fkey(username, avatar_url, instagram_username, whatsapp_number)')
+    .eq('event_id', id);
+
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load PRs for event');
+
+  const prs = (data ?? []).map((row) => ({
+    id: row.pr_id,
+    username: row.profiles?.username,
+    avatar_url: row.profiles?.avatar_url,
+    instagram_username: row.profiles?.instagram_username,
+    whatsapp_number: row.profiles?.whatsapp_number,
+  }));
+  return c.json({ prs });
 });
 
 /**
@@ -106,6 +154,9 @@ events.post(
         starts_at: body.starts_at,
         ends_at: body.ends_at ?? null,
         created_by: user.id,
+        has_presales: body.has_presales,
+        photo_url: body.photo_url,
+        free_drink: body.free_drink,
       })
       .select('*')
       .single();
@@ -170,6 +221,37 @@ events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), 
     },
   );
   return c.json({ event: data });
+});
+
+/** POST /events/:id/join — PR joins an event. */
+events.post('/:id/join', requireAuth, requireRole('organizer'), async (c) => {
+  const id = uuidParam(c);
+  const user = c.get('user');
+
+  const { error } = await supabase
+    .from('event_prs')
+    .insert({ event_id: id, pr_id: user.id });
+
+  if (error?.code === '23505') {
+    return c.json({ success: true }); // Already joined
+  }
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not join event');
+  return c.json({ success: true });
+});
+
+/** DELETE /events/:id/join — PR leaves an event. */
+events.delete('/:id/join', requireAuth, requireRole('organizer'), async (c) => {
+  const id = uuidParam(c);
+  const user = c.get('user');
+
+  const { error } = await supabase
+    .from('event_prs')
+    .delete()
+    .eq('event_id', id)
+    .eq('pr_id', user.id);
+
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not leave event');
+  return c.json({ success: true });
 });
 
 /**

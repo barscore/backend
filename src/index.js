@@ -27,6 +27,7 @@ import boostRoutes from './routes/boosts.js';
 import plusRoutes from './routes/plus.js';
 import stripeWebhookRoutes from './routes/stripeWebhook.js';
 import cronRoutes from './routes/cron.js';
+import authRoutes from './routes/auth.js';
 
 const app = new Hono();
 
@@ -142,6 +143,7 @@ app.route('/boosts', boostRoutes);
 app.route('/plus', plusRoutes);
 app.route('/stripe', stripeWebhookRoutes);
 app.route('/cron', cronRoutes);
+app.route('/auth', authRoutes);
 
 app.notFound((c) =>
   c.json({ error: 'Not found', code: 'NOT_FOUND', statusCode: 404 }, 404),

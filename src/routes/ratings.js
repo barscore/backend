@@ -135,6 +135,32 @@ ratings.delete('/:rid', requireAuth, async (c) => {
 
   const { error } = await supabase.from('ratings').delete().eq('id', rid);
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete rating');
+
+  // Se è l'utente stesso che elimina la recensione (o un admin per conto suo)
+  // verifichiamo se scende sotto le 5 recensioni e in tal caso revochiamo il token.
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('is_explorer, plus_until, free_drink_token')
+    .eq('id', existing.user_id)
+    .maybeSingle();
+
+  if (profile?.is_explorer && profile?.free_drink_token) {
+    const isPlus = profile.plus_until && new Date(profile.plus_until) > new Date();
+    if (!isPlus) {
+      const { count } = await supabase
+        .from('ratings')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', existing.user_id);
+        
+      if ((count ?? 0) < 5) {
+        await supabase
+          .from('profiles')
+          .update({ free_drink_token: null })
+          .eq('id', existing.user_id);
+      }
+    }
+  }
+
   return c.json({ success: true });
 });
 

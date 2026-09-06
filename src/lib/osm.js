@@ -243,3 +243,19 @@ export async function searchBars(query, limit = 20, bias = null) {
       };
     });
 }
+
+/**
+ * Reverse geocode a lat/lng via Nominatim.
+ */
+export async function reverseGeocode(lat, lng) {
+  const url = `${NOMINATIM_URL}/reverse?format=jsonv2&lat=${lat}&lon=${lng}`;
+  const res = await fetch(url, { headers: { 'User-Agent': UA } });
+  if (!res.ok) throw new Error(`Nominatim error ${res.status}`);
+  const data = await res.json();
+  if (!data || data.error) return null;
+  const a = data.address || {};
+  return {
+    address: [a.road, a.house_number].filter(Boolean).join(' ') || null,
+    city: a.city || a.town || a.village || a.county || null,
+  };
+}
