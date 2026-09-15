@@ -18,3 +18,8 @@ export const listRatingsQuerySchema = z.object({
   page: z.coerce.number().int().min(1).optional().default(1),
   limit: z.coerce.number().int().min(1).max(100).optional().default(20),
 });
+
+// Risposta del proprietario a una recensione: stesso tetto del commento utente.
+export const replyRatingSchema = z.object({
+  risposta: z.string().trim().min(1).max(500),
+});

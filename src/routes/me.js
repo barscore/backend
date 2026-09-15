@@ -100,7 +100,7 @@ me.get('/ratings', async (c) => {
   const { data, error } = await supabase
     .from('ratings')
     .select(
-      'id, bar_id, prezzo, qualita_drinks, socialita, varieta, orari, commento, created_at, updated_at, bars(id, name, address, city)',
+      'id, bar_id, prezzo, qualita_drinks, socialita, varieta, orari, commento, risposta, risposta_at, created_at, updated_at, bars(id, name, address, city)',
     )
     .eq('user_id', user.id)
     .order('created_at', { ascending: false });

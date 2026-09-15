@@ -4,10 +4,12 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { isPlus } from '../lib/plus.js';
+import { notify } from '../lib/notify.js';
 import {
   createRatingSchema,
   updateRatingSchema,
   listRatingsQuerySchema,
+  replyRatingSchema,
 } from '../schemas/ratingSchemas.js';
 
 // Mounted at /bars/:id/ratings — parent :id param is available here.
@@ -42,7 +44,7 @@ ratings.get('/', async (c) => {
 
   const { data, error, count } = await supabase
     .from('ratings')
-    .select('id, prezzo, qualita_drinks, socialita, varieta, orari, commento, created_at, profiles(username, avatar_url, plus_until, is_explorer)', {
+    .select('id, prezzo, qualita_drinks, socialita, varieta, orari, commento, risposta, risposta_at, created_at, profiles(username, avatar_url, plus_until, is_explorer)', {
       count: 'exact',
     })
     .eq('bar_id', barId)
@@ -161,6 +163,86 @@ ratings.delete('/:rid', requireAuth, async (c) => {
     }
   }
 
+  return c.json({ success: true });
+});
+
+/**
+ * Risposta del proprietario a una recensione.
+ *
+ * Una recensione ha al massimo una risposta e a scriverla è sempre lo stesso
+ * soggetto (`bars.owner_id`), quindi vive come colonna sulla riga: niente
+ * tabella a parte. Admin e moderatori possono solo rimuoverla (moderazione).
+ */
+async function loadReplyTarget(barId, rid) {
+  const { data: bar } = await supabase
+    .from('bars')
+    .select('id, name, owner_id')
+    .eq('id', barId)
+    .maybeSingle();
+  if (!bar) throw new AppError(404, 'NOT_FOUND', 'Bar non trovato');
+
+  const { data: rating } = await supabase
+    .from('ratings')
+    .select('id, user_id')
+    .eq('id', rid)
+    .eq('bar_id', barId)
+    .maybeSingle();
+  if (!rating) throw new AppError(404, 'NOT_FOUND', 'Rating not found');
+
+  return { bar, rating };
+}
+
+/** PUT /bars/:id/ratings/:rid/reply — scrive o sostituisce la risposta. */
+ratings.put('/:rid/reply', requireAuth, async (c) => {
+  const barId = uuidParam(c);
+  const rid = uuidParam(c, 'rid');
+  const user = c.get('user');
+  const { risposta } = replyRatingSchema.parse(await c.req.json());
+  await assertRatingsEnabled();
+
+  const { bar, rating } = await loadReplyTarget(barId, rid);
+  if (bar.owner_id !== user.id) {
+    throw new AppError(403, 'FORBIDDEN', 'Solo il proprietario del bar può rispondere');
+  }
+
+  const { data, error } = await supabase
+    .from('ratings')
+    .update({ risposta, risposta_at: new Date().toISOString() })
+    .eq('id', rid)
+    .select('id, risposta, risposta_at')
+    .single();
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not save reply');
+
+  // Best-effort: una notifica mancata non deve far fallire la risposta.
+  if (rating.user_id !== user.id) {
+    await notify([rating.user_id], {
+      type: 'rating_reply',
+      title: `${bar.name} ha risposto alla tua recensione`,
+      body: risposta.slice(0, 500),
+      link: `/bar/${barId}`,
+    });
+  }
+
+  return c.json({ rating: data });
+});
+
+/** DELETE /bars/:id/ratings/:rid/reply — proprietario o staff. */
+ratings.delete('/:rid/reply', requireAuth, async (c) => {
+  const barId = uuidParam(c);
+  const rid = uuidParam(c, 'rid');
+  const user = c.get('user');
+
+  const { bar } = await loadReplyTarget(barId, rid);
+  const isStaff = user.role === 'admin' || user.role === 'moderator';
+  if (bar.owner_id !== user.id && !isStaff) {
+    throw new AppError(403, 'FORBIDDEN', 'Solo il proprietario del bar può rispondere');
+  }
+
+  const { error } = await supabase
+    .from('ratings')
+    .update({ risposta: null, risposta_at: null })
+    .eq('id', rid);
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete reply');
   return c.json({ success: true });
 });
 
