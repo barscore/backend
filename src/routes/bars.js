@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { audit } from '../lib/audit.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import {
   nearbyQuerySchema,
@@ -255,25 +256,40 @@ bars.post(
 );
 
 /**
- * POST /bars/redeem-drink — bar owners can redeem a user's free drink token.
+ * POST /bars/redeem-drink — il proprietario convalida al bancone il free drink
+ * di un cliente, per uno dei SUOI bar che aderisce al programma.
+ *
+ * Tutto il riscatto sta nell'RPC `redeem_free_drink` (fix_security_report.sql):
+ * UPDATE condizionale sul token (niente check-then-use, due scansioni
+ * concorrenti non passano entrambe), verifica del bar, riga nel registro.
  */
+const REDEEM_ERRORS = {
+  bar_not_eligible: [403, 'FORBIDDEN', 'Il bar non è tuo, non è attivo o non accetta free drink'],
+  self: [403, 'FORBIDDEN', 'Non puoi riscattare il tuo stesso drink'],
+  invalid: [404, 'NOT_FOUND', 'Codice non valido o già utilizzato'],
+  already_redeemed: [409, 'CONFLICT', 'Questo account ha già riscattato il suo free drink'],
+};
+
 bars.post(
   '/redeem-drink',
+  sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'redeem-drink' }),
   requireAuth,
   async (c) => {
     const user = c.get('user');
-    const { token } = await c.req.json();
-    if (!token) throw new AppError(400, 'BAD_REQUEST', 'Token mancante');
+    const { token, bar_id } = z
+      .object({ token: z.string().uuid(), bar_id: z.string().uuid() })
+      .parse(await c.req.json());
 
-    const { data: ownedBars } = await supabase.from('bars').select('id, name').eq('owner_id', user.id);
-    if (!ownedBars || ownedBars.length === 0) throw new AppError(403, 'FORBIDDEN', 'Non sei il proprietario di alcun bar');
-
-    // Trova l'utente col token
-    const { data: profile } = await supabase.from('profiles').select('id').eq('free_drink_token', token).maybeSingle();
-    if (!profile) throw new AppError(404, 'NOT_FOUND', 'Codice non valido o già utilizzato');
-
-    const { error } = await supabase.from('profiles').update({ free_drink_token: null }).eq('id', profile.id);
+    const { data: status, error } = await supabase.rpc('redeem_free_drink', {
+      p_token: token,
+      p_bar_id: bar_id,
+      p_owner_id: user.id,
+    });
     if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Errore durante il riscatto');
+    if (status !== 'ok') {
+      const [code, name, msg] = REDEEM_ERRORS[status] ?? [500, 'INTERNAL_ERROR', 'Errore durante il riscatto'];
+      throw new AppError(code, name, msg);
+    }
 
     return c.json({ success: true });
   }
@@ -336,6 +352,7 @@ bars.post('/', requireAuth, requireRole('admin', 'moderator'), async (c) => {
       throw new AppError(409, 'CONFLICT', 'Bar with this place id already exists');
     throw new AppError(500, 'INTERNAL_ERROR', 'Could not create bar');
   }
+  await audit(user.id, 'bar.create', { targetType: 'bar', targetId: data.id, payload: { name: data.name } });
   return c.json({ bar: data }, 201);
 });
 
@@ -353,6 +370,7 @@ bars.put('/:id', requireAuth, requireRole('admin', 'moderator'), async (c) => {
 
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update bar');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Bar not found');
+  await audit(c.get('user').id, 'bar.update', { targetType: 'bar', targetId: id, payload: body });
   return c.json({ bar: data });
 });
 
@@ -363,11 +381,12 @@ bars.delete('/:id', requireAuth, requireRole('admin'), async (c) => {
     .from('bars')
     .delete()
     .eq('id', id)
-    .select('id')
+    .select('id, name')
     .maybeSingle();
 
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete bar');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Bar not found');
+  await audit(c.get('user').id, 'bar.delete', { targetType: 'bar', targetId: id, payload: { name: data.name } });
   return c.json({ success: true });
 });
 

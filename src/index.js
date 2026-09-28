@@ -40,7 +40,19 @@ const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
   .filter(Boolean);
 
 app.use('*', logger());
-app.use('*', secureHeaders());
+// Un'API JSON non serve mai HTML né script: la CSP più stretta possibile, così
+// una risposta aperta per sbaglio nel browser non può eseguire niente.
+app.use(
+  '*',
+  secureHeaders({
+    contentSecurityPolicy: {
+      defaultSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+      baseUri: ["'none'"],
+      formAction: ["'none'"],
+    },
+  }),
+);
 
 app.use(
   '*',
@@ -89,6 +101,9 @@ app.use('*', async (c, next) => {
   // Same for the scheduler: it authenticates with CRON_SECRET, has no Bearer
   // token, and beta_mode would otherwise silently stop every reminder.
   if (c.req.path.startsWith('/cron/')) return next();
+  // Il login non scrive niente: è un POST solo perché porta la password. Senza
+  // questa eccezione in beta nessuno (admin compresi) entra con lo username.
+  if (c.req.path === '/auth/login') return next();
 
   const { data: settings } = await supabase
     .from('app_settings')

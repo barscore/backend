@@ -1,8 +1,9 @@
-import { uuidParam } from '../schemas/common.js';
+import { uuidParam, escapeLike } from '../schemas/common.js';
 import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { audit } from '../lib/audit.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
 import {
@@ -58,7 +59,7 @@ reports.get('/', async (c) => {
 
   if (type) query = query.eq('type', type);
   if (status) query = query.eq('status', status);
-  if (q) query = query.ilike('message', `%${q.replace(/[,()]/g, ' ').trim()}%`);
+  if (q) query = query.ilike('message', `%${escapeLike(q.trim())}%`);
 
   const { data, error, count } = await query;
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load reports');
@@ -91,6 +92,7 @@ reports.patch('/:id', async (c) => {
       body: admin_note ? `${base}\n\n${admin_note}` : base,
     });
   }
+  await audit(c.get('user').id, 'report.update', { targetType: 'report', targetId: id, payload: { status, admin_note: admin_note ?? null } });
   return c.json({ report: { id: data.id, status: data.status } });
 });
 
@@ -105,6 +107,7 @@ reports.delete('/:id', async (c) => {
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete report');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Segnalazione non trovata');
+  await audit(c.get('user').id, 'report.delete', { targetType: 'report', targetId: id });
   return c.json({ success: true });
 });
 

@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
-import crypto from 'node:crypto';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { isPlus } from '../lib/plus.js';
+import { issueFreeDrinkToken } from '../lib/freeDrink.js';
 import { myDrinkVotesQuerySchema } from '../schemas/drinkSchemas.js';
 import {
   createOrganizerRequestSchema,
@@ -186,12 +186,13 @@ me.post('/promo', async (c) => {
     is_new = true;
   }
 
-  if (ratingsCount >= 5 && !current.free_drink_token) {
-    const { error: upErr } = await supabase
-      .from('profiles')
-      .update({ free_drink_token: crypto.randomUUID() })
-      .eq('id', user.id);
-    if (upErr) throw new AppError(500, 'INTERNAL_ERROR', 'Could not generate token');
+  let hasToken = !!current.free_drink_token;
+  if (ratingsCount >= 5 && !hasToken) {
+    try {
+      hasToken = await issueFreeDrinkToken(user.id);
+    } catch {
+      throw new AppError(500, 'INTERNAL_ERROR', 'Could not generate token');
+    }
   }
 
   return c.json({
@@ -199,7 +200,7 @@ me.post('/promo', async (c) => {
     promo: 'explorer',
     is_new,
     ratings_count: ratingsCount,
-    has_token: ratingsCount >= 5 || !!current.free_drink_token
+    has_token: hasToken,
   });
 });
 
@@ -266,6 +267,18 @@ me.get('/claims', async (c) => {
       bars: undefined,
     })),
   });
+});
+
+/** GET /me/bars — bars the caller owns (the redeem screen picks one). */
+me.get('/bars', async (c) => {
+  const user = c.get('user');
+  const { data, error } = await supabase
+    .from('bars')
+    .select('id, name, city, is_active, accepts_free_drinks')
+    .eq('owner_id', user.id)
+    .order('name');
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load bars');
+  return c.json({ bars: data ?? [] });
 });
 
 /** GET /me/follows — followed targets, for the UI toggle state. */

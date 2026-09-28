@@ -1,8 +1,9 @@
-import { uuidParam } from '../schemas/common.js';
+import { uuidParam, orSafeLike } from '../schemas/common.js';
 import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole, optionalUser } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { audit } from '../lib/audit.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
 import {
@@ -62,10 +63,8 @@ suggestions.get('/', async (c) => {
     .range(from, to);
 
   if (status) query = query.eq('status', status);
-  // Strip PostgREST .or() metacharacters — a "," or ")" in q would otherwise be
-  // parsed as extra filter conditions (filter injection).
   if (q) {
-    const safe = q.replace(/[,()]/g, ' ').trim();
+    const safe = orSafeLike(q);
     if (safe) query = query.or(`name.ilike.%${safe}%,city.ilike.%${safe}%`);
   }
 
@@ -100,6 +99,7 @@ suggestions.patch('/:id', async (c) => {
       body: admin_note ? `${base}\n\n${admin_note}` : base,
     });
   }
+  await audit(c.get('user').id, 'suggestion.update', { targetType: 'bar_suggestion', targetId: id, payload: { status, admin_note: admin_note ?? null } });
   return c.json({ suggestion: { id: data.id, status: data.status } });
 });
 
@@ -114,6 +114,7 @@ suggestions.delete('/:id', async (c) => {
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete suggestion');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Segnalazione non trovata');
+  await audit(c.get('user').id, 'suggestion.delete', { targetType: 'bar_suggestion', targetId: id });
   return c.json({ success: true });
 });
 

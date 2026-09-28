@@ -1,8 +1,9 @@
-import { uuidParam } from '../schemas/common.js';
+import { uuidParam, escapeLike } from '../schemas/common.js';
 import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole, optionalUser } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { audit } from '../lib/audit.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { assertRatingsEnabled } from './ratings.js';
 import { notify } from '../lib/notify.js';
@@ -19,9 +20,6 @@ import {
 // public read; votes need auth; proposals mirror the bar-suggestions flow
 // (public create, staff moderation, drink materialized on approval).
 const drinks = new Hono();
-
-// Escape LIKE wildcards in user input so "%" / "_" match literally.
-const escapeLike = (s) => s.replace(/[%_]/g, '\\$&');
 
 // ---------------------------------------------------------------------------
 // Moderation sub-router. Mounted before any /:id route so the static
@@ -135,6 +133,7 @@ suggestions.patch('/:id', async (c) => {
       link: drink?.id ? `/drink/${drink.id}` : null,
     });
   }
+  await audit(c.get('user').id, 'drink_suggestion.update', { targetType: 'drink_suggestion', targetId: id, payload: { status, drink_id: drink?.id ?? null, admin_note: admin_note ?? null } });
   return c.json({ suggestion: data, drink });
 });
 
@@ -149,6 +148,7 @@ suggestions.delete('/:id', async (c) => {
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete suggestion');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Proposta non trovata');
+  await audit(c.get('user').id, 'drink_suggestion.delete', { targetType: 'drink_suggestion', targetId: id });
   return c.json({ success: true });
 });
 

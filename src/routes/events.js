@@ -1,7 +1,9 @@
 import { uuidParam } from '../schemas/common.js';
 import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
+import { requireAuth, requireRole, optionalUser } from '../middleware/auth.js';
+import { audit } from '../lib/audit.js';
+import { z } from 'zod';
 import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
@@ -92,23 +94,35 @@ events.get('/:id', async (c) => {
   return c.json({ event });
 });
 
-/** GET /events/:id/prs — list PRs assigned to an event. */
+/**
+ * GET /events/:id/prs — PR approvati dal creatore dell'evento. Il creatore
+ * vede anche le candidature in attesa, il PR vede la propria.
+ */
 events.get('/:id/prs', async (c) => {
   const id = uuidParam(c);
-  const { data, error } = await supabase
-    .from('event_prs')
-    .select('pr_id, profiles!event_prs_pr_id_fkey(username, avatar_url, instagram_username, whatsapp_number)')
-    .eq('event_id', id);
+  const uid = await optionalUser(c);
+
+  const [{ data: ev }, { data, error }] = await Promise.all([
+    supabase.from('events').select('created_by').eq('id', id).maybeSingle(),
+    supabase
+      .from('event_prs')
+      .select('pr_id, approved_at, profiles!event_prs_pr_id_fkey(username, avatar_url, instagram_username, whatsapp_number)')
+      .eq('event_id', id),
+  ]);
 
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load PRs for event');
 
-  const prs = (data ?? []).map((row) => ({
-    id: row.pr_id,
-    username: row.profiles?.username,
-    avatar_url: row.profiles?.avatar_url,
-    instagram_username: row.profiles?.instagram_username,
-    whatsapp_number: row.profiles?.whatsapp_number,
-  }));
+  const isCreator = !!uid && ev?.created_by === uid;
+  const prs = (data ?? [])
+    .filter((row) => row.approved_at || isCreator || row.pr_id === uid)
+    .map((row) => ({
+      id: row.pr_id,
+      pending: !row.approved_at,
+      username: row.profiles?.username,
+      avatar_url: row.profiles?.avatar_url,
+      instagram_username: row.profiles?.instagram_username,
+      whatsapp_number: row.profiles?.whatsapp_number,
+    }));
   return c.json({ prs });
 });
 
@@ -223,19 +237,108 @@ events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), 
   return c.json({ event: data });
 });
 
-/** POST /events/:id/join — PR joins an event. */
+/**
+ * POST /events/:id/join — un PR si candida su un evento. Non compare in
+ * pubblico finché il creatore non approva: senza, qualunque organizer poteva
+ * agganciarsi agli eventi altrui e dirottare le prevendite sui suoi contatti.
+ */
 events.post('/:id/join', requireAuth, requireRole('organizer'), async (c) => {
   const id = uuidParam(c);
   const user = c.get('user');
 
+  const [{ data: me }, { data: ev }] = await Promise.all([
+    supabase.from('profiles').select('organizer_type, username').eq('id', user.id).maybeSingle(),
+    supabase.from('events').select('id, title, created_by, cancelled_at').eq('id', id).maybeSingle(),
+  ]);
+  if (me?.organizer_type !== 'pr') {
+    throw new AppError(403, 'FORBIDDEN', 'Solo gli account PR possono unirsi agli eventi');
+  }
+  if (!ev) throw new AppError(404, 'NOT_FOUND', 'Event not found');
+  if (ev.cancelled_at) throw new AppError(409, 'CONFLICT', 'Evento annullato');
+
+  const ownEvent = ev.created_by === user.id;
   const { error } = await supabase
     .from('event_prs')
-    .insert({ event_id: id, pr_id: user.id });
+    .insert({ event_id: id, pr_id: user.id, approved_at: ownEvent ? new Date().toISOString() : null });
 
   if (error?.code === '23505') {
-    return c.json({ success: true }); // Already joined
+    const { data: row } = await supabase
+      .from('event_prs')
+      .select('approved_at')
+      .eq('event_id', id)
+      .eq('pr_id', user.id)
+      .maybeSingle();
+    return c.json({ success: true, pending: !row?.approved_at });
   }
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not join event');
+
+  if (!ownEvent) {
+    await notify([ev.created_by], {
+      type: 'pr_request',
+      title: `Nuovo PR per ${ev.title}`,
+      body: `${me.username} chiede di comparire come PR del tuo evento.`,
+      link: `/event/${id}`,
+    });
+  }
+  return c.json({ success: true, pending: !ownEvent });
+});
+
+/** Il creatore dell'evento (o lo staff) può decidere sui PR. */
+async function loadManagedEvent(c) {
+  const id = uuidParam(c);
+  const prId = uuidParam(c, 'prId');
+  const user = c.get('user');
+  const { data: ev } = await supabase
+    .from('events')
+    .select('id, title, created_by')
+    .eq('id', id)
+    .maybeSingle();
+  if (!ev) throw new AppError(404, 'NOT_FOUND', 'Event not found');
+  const isStaff = user.role === 'admin' || user.role === 'moderator';
+  if (ev.created_by !== user.id && !isStaff) {
+    throw new AppError(403, 'FORBIDDEN', 'Solo il creatore dell\'evento gestisce i suoi PR');
+  }
+  return { ev, prId, user, isStaff: isStaff && ev.created_by !== user.id };
+}
+
+/** POST /events/:id/prs/:prId/approve — il creatore approva un PR. */
+events.post('/:id/prs/:prId/approve', requireAuth, async (c) => {
+  const { ev, prId, user, isStaff } = await loadManagedEvent(c);
+  const { data, error } = await supabase
+    .from('event_prs')
+    .update({ approved_at: new Date().toISOString() })
+    .eq('event_id', ev.id)
+    .eq('pr_id', prId)
+    .is('approved_at', null)
+    .select('pr_id')
+    .maybeSingle();
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not approve PR');
+  if (!data) throw new AppError(404, 'NOT_FOUND', 'Nessuna candidatura in attesa');
+
+  await notify([prId], {
+    type: 'pr_approved',
+    title: 'Sei PR dell\'evento',
+    body: `Il creatore di «${ev.title}» ti ha approvato come PR.`,
+    link: `/event/${ev.id}`,
+  });
+  if (isStaff) {
+    await audit(user.id, 'event.pr_approve', { targetType: 'event', targetId: ev.id, payload: { pr_id: prId } });
+  }
+  return c.json({ success: true });
+});
+
+/** DELETE /events/:id/prs/:prId — il creatore rifiuta o rimuove un PR. */
+events.delete('/:id/prs/:prId', requireAuth, async (c) => {
+  const { ev, prId, user, isStaff } = await loadManagedEvent(c);
+  const { error } = await supabase
+    .from('event_prs')
+    .delete()
+    .eq('event_id', ev.id)
+    .eq('pr_id', prId);
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not remove PR');
+  if (isStaff) {
+    await audit(user.id, 'event.pr_remove', { targetType: 'event', targetId: ev.id, payload: { pr_id: prId } });
+  }
   return c.json({ success: true });
 });
 
@@ -291,19 +394,19 @@ events.delete('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'
     .from('events')
     .delete()
     .eq('id', id)
-    .select('id')
+    .select('id, title')
     .maybeSingle();
 
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete event');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Event not found');
+  await audit(user.id, 'event.delete', { targetType: 'event', targetId: id, payload: { title: data.title } });
   return c.json({ success: true });
 });
 
 
 /** POST /events/verify-entry — organizers checking user QR code for party entry */
 events.post('/verify-entry', requireAuth, requireRole('organizer', 'admin', 'moderator'), async (c) => {
-  const { user_id } = await c.req.json();
-  if (!user_id) throw new AppError(400, 'BAD_REQUEST', 'ID utente mancante');
+  const { user_id } = z.object({ user_id: z.string().uuid() }).parse(await c.req.json());
 
   const { data: profile, error } = await supabase
     .from('profiles')

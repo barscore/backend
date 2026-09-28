@@ -1,5 +1,5 @@
 import { supabase } from './supabase.js';
-import crypto from 'node:crypto';
+import { issueFreeDrinkToken } from './freeDrink.js';
 
 /**
  * rabar+ — piani di abbonamento.
@@ -84,18 +84,11 @@ export async function syncSubscription(sub, { userId } = {}) {
     );
 
   if (ACTIVE_STATUSES.has(sub.status) && end) {
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('free_drink_token')
-      .eq('id', uid)
-      .maybeSingle();
-
-    const updatePayload = { plus_until: end };
-    if (!profile?.free_drink_token) {
-      updatePayload.free_drink_token = crypto.randomUUID();
-    }
-    
-    await supabase.from('profiles').update(updatePayload).eq('id', uid);
+    await supabase.from('profiles').update({ plus_until: end }).eq('id', uid);
+    // Best-effort: il drink non deve far fallire il webhook che dà il diritto.
+    await issueFreeDrinkToken(uid).catch((e) =>
+      console.error('[plus] free drink token non emesso:', e.message),
+    );
   }
 
   return { user_id: uid, status: sub.status, plus_until: end };

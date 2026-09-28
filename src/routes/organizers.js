@@ -279,7 +279,32 @@ organizers.post('/claims/:id/revoke', async (c) => {
     .eq('id', claim.bar_id)
     .eq('owner_id', claim.user_id);
 
-  return c.json({ success: true });
+  // Il ruolo organizer/proprietario viene solo dal possesso di un bar: senza
+  // più bar si torna utente. PR e organizzatori (ruolo dato per richiesta, non
+  // per claim) e lo staff restano come sono.
+  const { count } = await supabase
+    .from('bars')
+    .select('id', { count: 'exact', head: true })
+    .eq('owner_id', claim.user_id);
+  let demoted = false;
+  if (!count) {
+    const { data: demotedRow } = await supabase
+      .from('profiles')
+      .update({ role: 'user', organizer_type: null })
+      .eq('id', claim.user_id)
+      .eq('role', 'organizer')
+      .eq('organizer_type', 'proprietario')
+      .select('id')
+      .maybeSingle();
+    demoted = !!demotedRow;
+  }
+
+  await audit(c.get('user').id, 'claim.revoke', {
+    targetType: 'bar_claim',
+    targetId: id,
+    payload: { user_id: claim.user_id, bar_id: claim.bar_id, demoted },
+  });
+  return c.json({ success: true, demoted });
 });
 
 export default organizers;

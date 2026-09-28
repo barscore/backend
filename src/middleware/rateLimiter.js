@@ -16,16 +16,23 @@ const LOCAL_PREFILTER_FACTOR = 4;
 // soppressi, dice la stessa cosa.
 const RPC_LOG_THROTTLE_MS = 60_000;
 
-function clientIp(c) {
-  // x-forwarded-for is client-forgeable: any caller can pre-fill it and rotate
-  // values to get a fresh bucket per request. Only the LAST entry was appended
-  // by the trusted proxy in front of us, so that's the only hop to key on.
-  const xff = c.req.header('x-forwarded-for');
-  if (xff) {
-    const hops = xff.split(',');
-    return hops[hops.length - 1].trim() || 'unknown';
+// Da quale header viene l'IP del client. Non si prende mai X-Forwarded-For
+// così com'è: con più proxy in catena l'ultimo hop è il proxy (tutti nello
+// stesso bucket), e senza proxy davanti il client lo riempie a piacere e ruota
+// bucket a ogni richiesta.
+//   - su Vercel `x-real-ip` lo scrive l'edge e il client non lo può forzare;
+//   - dietro un'altra CDN si imposta TRUSTED_IP_HEADER (es. cf-connecting-ip),
+//     e quel proxy deve sovrascrivere l'header, non inoltrarlo;
+//   - altrimenti (Docker esposto diretto) conta solo l'indirizzo del socket.
+const TRUSTED_IP_HEADER = (
+  process.env.TRUSTED_IP_HEADER || (process.env.VERCEL ? 'x-real-ip' : '')
+).toLowerCase();
+
+export function clientIp(c) {
+  if (TRUSTED_IP_HEADER) {
+    return c.req.header(TRUSTED_IP_HEADER)?.split(',')[0].trim() || 'unknown';
   }
-  return c.req.header('x-real-ip') || 'unknown';
+  return c.env?.incoming?.socket?.remoteAddress || 'unknown';
 }
 
 /**
@@ -120,6 +127,9 @@ export function rateLimiter({ windowMs = DEFAULT_WINDOW_MS, max = DEFAULT_MAX } 
  * Come rateLimiter, ma il conteggio autorevole sta su Postgres (RPC atomica
  * `hit_rate_limit`), quindi il limite è uno solo per tutte le istanze e
  * sopravvive ai cold start.
+ *   by  — facoltativo, `async (c) => string`: l'identità da contare al posto
+ *         dell'IP (es. l'account sotto attacco nel login). Stringa vuota =
+ *         nessun conteggio per questa richiesta.
  *   key — prefisso obbligatorio della rotta ('suggestions', 'bars-resolve'…):
  *         il bucket è `key:hmac(ip)`, così due rotte con limiti diversi non si
  *         mangiano a vicenda il contatore e la tabella non conserva indirizzi
@@ -132,7 +142,7 @@ export function rateLimiter({ windowMs = DEFAULT_WINDOW_MS, max = DEFAULT_MAX } 
  * opposto — fail-closed — spegnerebbe segnalazioni e report degli utenti per un
  * problema che non è loro.
  */
-export function sharedRateLimiter({ windowMs = DEFAULT_WINDOW_MS, max = DEFAULT_MAX, key } = {}) {
+export function sharedRateLimiter({ windowMs = DEFAULT_WINDOW_MS, max = DEFAULT_MAX, key, by } = {}) {
   if (!key) throw new Error('sharedRateLimiter richiede una key che identifichi la rotta');
 
   const hit = memoryBuckets(windowMs);
@@ -154,7 +164,8 @@ export function sharedRateLimiter({ windowMs = DEFAULT_WINDOW_MS, max = DEFAULT_
 
   return async function sharedRateLimit(c, next) {
     const now = Date.now();
-    const ip = clientIp(c);
+    const ip = by ? await by(c) : clientIp(c);
+    if (!ip) return next();
     // In memoria l'IP in chiaro va bene (il processo muore e se lo porta via);
     // sul bucket condiviso, che è una tabella, ci va l'HMAC. Vedi hashedIp().
     const bucketKey = `${key}:${hashedIp(ip)}`;

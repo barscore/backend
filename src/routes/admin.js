@@ -1,4 +1,4 @@
-import { uuidParam } from '../schemas/common.js';
+import { uuidParam, escapeLike, orSafeLike } from '../schemas/common.js';
 import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
@@ -12,13 +12,21 @@ import {
   roleSchema,
   settingsSchema,
   listRatingsQuerySchema,
+  listAuditQuerySchema,
 } from '../schemas/adminSchemas.js';
 
 // Admin panel API. Every route is admin-only. Handles user moderation, rating
 // moderation, security settings and emergency operations. The backend uses the
 // service-role key, so these bypass RLS.
 const admin = new Hono();
-admin.use('*', requireAuth, requireRole('admin'));
+// '/admin/organizers' è un router a parte montato sotto lo stesso prefisso: il
+// '*' di qui lo coprirebbe e chiuderebbe fuori i moderatori, che lì sono
+// ammessi. Ha già il suo requireAuth + requireRole('admin', 'moderator').
+const adminOnly = [requireAuth, requireRole('admin')];
+admin.use('*', async (c, next) => {
+  if (c.req.path.startsWith('/admin/organizers')) return next();
+  await adminOnly[0](c, () => adminOnly[1](c, next));
+});
 
 // Indirizzo dei reclami, lo stesso pubblicato nei ToS: ogni motivazione DSA
 // deve dire dove si contesta la decisione.
@@ -88,10 +96,8 @@ admin.get('/users', async (c) => {
       ? query.gt('suspended_until', nowIso)
       : query.or(`suspended_until.is.null,suspended_until.lte.${nowIso}`);
   }
-  // Strip PostgREST .or() metacharacters — a "," or ")" in q would otherwise be
-  // parsed as extra filter conditions (filter injection).
   if (q) {
-    const safe = q.replace(/[,()]/g, ' ').trim();
+    const safe = orSafeLike(q);
     if (safe) query = query.or(`username.ilike.%${safe}%,email.ilike.%${safe}%`);
   }
 
@@ -306,7 +312,7 @@ admin.get('/ratings', async (c) => {
     .order('created_at', { ascending: false })
     .range(from, to);
 
-  if (q) query = query.ilike('commento', `%${q}%`);
+  if (q) query = query.ilike('commento', `%${escapeLike(q)}%`);
 
   const { data, error, count } = await query;
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load ratings');
@@ -353,6 +359,30 @@ admin.delete('/ratings/:id', async (c) => {
 // =========================================================================
 // Security settings + emergency operations
 // =========================================================================
+
+/** GET /admin/audit — registro delle azioni di staff, più recenti prima. */
+admin.get('/audit', async (c) => {
+  const { page, limit, actor_id, action } = listAuditQuerySchema.parse(
+    Object.fromEntries(new URL(c.req.url).searchParams),
+  );
+  const from = (page - 1) * limit;
+  let query = supabase
+    .from('admin_audit')
+    .select('id, actor_id, action, target_type, target_id, payload, created_at, profiles(username)', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(from, from + limit - 1);
+  if (actor_id) query = query.eq('actor_id', actor_id);
+  if (action) query = query.like('action', `${escapeLike(action)}%`);
+
+  const { data, error, count } = await query;
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load audit log');
+  return c.json({
+    entries: (data ?? []).map(({ profiles, ...e }) => ({ ...e, actor_username: profiles?.username ?? null })),
+    total: count ?? 0,
+    page,
+    limit,
+  });
+});
 
 /** GET /admin/settings — global switches (singleton row). */
 admin.get('/settings', async (c) => {

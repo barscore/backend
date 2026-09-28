@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { audit } from '../lib/audit.js';
 import { isPlus } from '../lib/plus.js';
 import { notify } from '../lib/notify.js';
 import {
@@ -137,6 +138,9 @@ ratings.delete('/:rid', requireAuth, async (c) => {
 
   const { error } = await supabase.from('ratings').delete().eq('id', rid);
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not delete rating');
+  if (existing.user_id !== user.id) {
+    await audit(user.id, 'rating.delete', { targetType: 'rating', targetId: rid, payload: { bar_id: barId, user_id: existing.user_id } });
+  }
 
   // Se è l'utente stesso che elimina la recensione (o un admin per conto suo)
   // verifichiamo se scende sotto le 5 recensioni e in tal caso revochiamo il token.

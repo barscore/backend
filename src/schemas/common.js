@@ -9,3 +9,11 @@ const uuidSchema = z.string().uuid();
 export function uuidParam(c, name = 'id') {
   return uuidSchema.parse(c.req.param(name));
 }
+
+// Escape LIKE wildcards (and the escape char itself) in user input so "%" / "_"
+// match literally: a bare "%%%%" would otherwise force a full unindexed scan.
+export const escapeLike = (s) => s.replace(/[\\%_]/g, '\\$&');
+
+// For PostgREST .or() strings: also strip its metacharacters — a "," or ")"
+// would otherwise be parsed as extra filter conditions (filter injection).
+export const orSafeLike = (s) => escapeLike(s.replace(/[,()]/g, ' ').trim());
