@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { findNearbyBars, geocode, searchBars, haversineKm } from '../lib/osm.js';
+import { bboxAround, bboxOf, withinBbox } from '../lib/bbox.js';
+import { readShared, writeShared } from '../lib/nearbyStore.js';
 import { supabase } from '../lib/supabase.js';
 import { AppError } from '../middleware/errorHandler.js';
 
@@ -18,6 +20,9 @@ const places = new Hono();
 //   * cold/expired        → the one unavoidable slow fetch.
 // The cache is persisted to disk so it survives `--watch` reloads and restarts
 // (the reason it felt "slow as before" — in-memory Map was wiped on every save).
+// Memory and disk belong to ONE instance. Behind them sits a table shared by
+// all of them (lib/nearbyStore.js): a brand-new instance asks it before asking
+// Overpass, so the slow fetch is paid once per area, not once per cold start.
 const NEARBY_TTL_MS = Number(process.env.NEARBY_CACHE_TTL_MS) || 30 * 60 * 1000; // fresh window
 const NEARBY_MAX_AGE_MS = Number(process.env.NEARBY_CACHE_MAX_AGE_MS) || 7 * 24 * 60 * 60 * 1000; // serve-stale window
 const NEARBY_CACHE_MAX = 2000;
@@ -64,11 +69,13 @@ function persistToDisk() {
   }, 2000);
 }
 
-function cacheSet(key, places) {
+// `at` is when the places were fetched from Overpass — now, unless the entry
+// comes from the shared table and another instance fetched it earlier.
+function cacheSet(key, places, at = Date.now()) {
   if (nearbyCache.size >= NEARBY_CACHE_MAX && !nearbyCache.has(key)) {
     nearbyCache.delete(nearbyCache.keys().next().value); // evict oldest
   }
-  nearbyCache.set(key, { at: Date.now(), places });
+  nearbyCache.set(key, { at, places });
   persistToDisk();
 }
 
@@ -76,14 +83,27 @@ function cacheSet(key, places) {
 function fetchAndCache(key, lat, lng, radius_km) {
   if (inflight.has(key)) return inflight.get(key);
   const p = findNearbyBars(lat, lng, radius_km)
-    .then((places) => {
+    .then(async (places) => {
       cacheSet(key, places);
+      // Awaited, not fired and forgotten: a serverless instance can be frozen
+      // the moment the response is out, and this write is what spares the next
+      // instance the wait. It costs milliseconds on a request that took seconds.
+      await writeShared(key, places);
       return places;
     })
     .finally(() => inflight.delete(key));
   inflight.set(key, p);
   return p;
 }
+
+// A persisted bar keeps the coordinates it had when it was saved; the OSM node
+// may have been nudged since. The box around the places is widened by this
+// much so a bar that moved a few hundred metres still gets its ratings.
+const BAR_DRIFT_KM = 1;
+
+// A boost is never shown further than this from the viewer, whatever radius
+// the owner paid for.
+const SPONSOR_MAX_KM = 50;
 
 /**
  * Overlay community ratings onto raw OSM places, matched by osm_node_id.
@@ -95,14 +115,17 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
   if (osmPlaces.length) {
     // Don't filter by the OSM ids: an Overpass result can hold 1000+ places, and
     // a `.in('osm_node_id', [1300 huge ints])` builds a ~13KB GET URL that makes
-    // PostgREST hang ~9s then fail. The `bars` table is small (only persisted,
-    // community-added venues), so fetch them all once and match in JS.
+    // PostgREST hang ~9s then fail. Filter by AREA instead — only the bars
+    // inside the box that holds these places can match — and match the ids in
+    // JS. Without it every map pan downloaded the whole table plus its join.
     const wanted = new Set(osmPlaces.map((p) => String(p.osm_node_id)));
-    const { data } = await supabase
-      .from('bars')
-      .select('id, osm_node_id, accepts_free_drinks, free_drinks_hours, boost_until, bar_ratings_summary(avg_overall, total_ratings)')
-      .not('osm_node_id', 'is', null)
-      .limit(10000);
+    const { data } = await withinBbox(
+      supabase
+        .from('bars')
+        .select('id, osm_node_id, accepts_free_drinks, free_drinks_hours, boost_until, bar_ratings_summary(avg_overall, total_ratings)')
+        .not('osm_node_id', 'is', null),
+      bboxOf(osmPlaces, BAR_DRIFT_KM),
+    ).limit(10000);
     byOsm = new Map(
       (data ?? [])
         .filter((b) => wanted.has(String(b.osm_node_id)))
@@ -132,28 +155,31 @@ async function enrichWithRatings(osmPlaces, lat, lng) {
  * Sponsored bars that the owner paid to show beyond the viewer's own radius.
  * Returned shaped like an OSM place (so clients render them in the same list),
  * flagged `sponsored: true`, and only within `min(sponsor_radius_km, 50)` km of
- * the viewer. `haveOsm` / `haveId` are the ids already in the /nearby result —
- * a sponsored bar the viewer is *also* near stays where it is (already flagged
- * by enrichWithRatings), it isn't added twice.
+ * the viewer. The ones already in the /nearby result are dropped by the caller.
  */
-async function nearbySponsoredExtras(lat, lng, haveOsm, haveId) {
+async function nearbySponsored(lat, lng) {
   // NB: niente `osm_type` nella select — quella colonna su `bars` non esiste e
   // non è mai esistita (nessuna migrazione la crea). Chiederla faceva fallire
   // l'INTERA query con 42703, e siccome l'errore non veniva letto la funzione
   // restituiva una lista vuota: il raggio di visibilità, che è a pagamento, non
   // ha mai iniettato un solo bar sulla mappa. `osm_type` lo mettiamo nella
   // forma di uscita più sotto, dove serve davvero.
-  const { data, error } = await supabase
-    .from('bars')
-    .select(
-      'id, osm_node_id, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url, sponsor_radius_km, accepts_free_drinks, free_drinks_hours, bar_ratings_summary(avg_overall, total_ratings)',
-    )
-    .eq('is_active', true)
-    .gt('boost_until', new Date().toISOString())
-    .not('sponsor_radius_km', 'is', null)
-    // Clients type a place's osm_node_id as non-null — an admin bar with no OSM
-    // node can't ride this list (it also has no map pin).
-    .not('osm_node_id', 'is', null);
+  const { data, error } = await withinBbox(
+    supabase
+      .from('bars')
+      .select(
+        'id, osm_node_id, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url, sponsor_radius_km, accepts_free_drinks, free_drinks_hours, bar_ratings_summary(avg_overall, total_ratings)',
+      )
+      .eq('is_active', true)
+      .gt('boost_until', new Date().toISOString())
+      .not('sponsor_radius_km', 'is', null)
+      // Clients type a place's osm_node_id as non-null — an admin bar with no OSM
+      // node can't ride this list (it also has no map pin).
+      .not('osm_node_id', 'is', null),
+    // Nothing further than the cap can pass the distance filter below: no
+    // point reading the boosted bars of another country.
+    bboxAround(lat, lng, SPONSOR_MAX_KM),
+  );
 
   // Rumoroso, non silenzioso: qui si consegna merce pagata, e una lista vuota è
   // indistinguibile da "nessuno ha comprato un boost". È il motivo per cui il
@@ -164,7 +190,6 @@ async function nearbySponsoredExtras(lat, lng, haveOsm, haveId) {
   }
 
   return (data ?? [])
-    .filter((b) => !haveId.has(b.id) && !haveOsm.has(String(b.osm_node_id)))
     .map((b) => ({
       ...b,
       // I luoghi da Overpass portano osm_type; questi vengono dal database, che
@@ -177,14 +202,23 @@ async function nearbySponsoredExtras(lat, lng, haveOsm, haveId) {
       sponsored: true,
       bar_ratings_summary: undefined,
     }))
-    .filter((b) => b.distance_km <= Math.min(b.sponsor_radius_km, 50));
+    .filter((b) => b.distance_km <= Math.min(b.sponsor_radius_km, SPONSOR_MAX_KM));
 }
 
-/** Prepend the out-of-radius sponsored bars to an enriched /nearby result. */
-async function withSponsoredExtras(enriched, lat, lng) {
+/**
+ * The /nearby payload: OSM places with their ratings, plus the out-of-radius
+ * sponsored bars in front. The two reads don't depend on each other, so they
+ * run together. A sponsored bar the viewer is *also* near stays where it is
+ * (already flagged by enrichWithRatings) — it isn't added twice.
+ */
+async function nearbyPayload(osmPlaces, lat, lng) {
+  const [enriched, sponsored] = await Promise.all([
+    enrichWithRatings(osmPlaces, lat, lng),
+    nearbySponsored(lat, lng),
+  ]);
   const haveOsm = new Set(enriched.map((p) => String(p.osm_node_id)));
   const haveId = new Set(enriched.map((p) => p.id).filter(Boolean));
-  const extras = await nearbySponsoredExtras(lat, lng, haveOsm, haveId);
+  const extras = sponsored.filter((b) => !haveId.has(b.id) && !haveOsm.has(String(b.osm_node_id)));
   return extras.length ? [...extras, ...enriched] : enriched;
 }
 
@@ -213,8 +247,19 @@ places.get('/nearby', async (c) => {
     Object.fromEntries(new URL(c.req.url).searchParams),
   );
   const key = cacheKey(lat, lng, radius_km);
-  const cached = nearbyCache.get(key);
-  const age = cached ? Date.now() - cached.at : Infinity;
+  let cached = nearbyCache.get(key);
+  let age = cached ? Date.now() - cached.at : Infinity;
+
+  // Nothing usable in this instance: before paying for Overpass, see whether
+  // another instance already did.
+  if (age >= NEARBY_MAX_AGE_MS) {
+    const shared = await readShared(key);
+    if (shared && Date.now() - shared.at < NEARBY_MAX_AGE_MS) {
+      cacheSet(key, shared.places, shared.at);
+      cached = nearbyCache.get(key);
+      age = Date.now() - cached.at;
+    }
+  }
 
   try {
     let results;
@@ -227,13 +272,11 @@ places.get('/nearby', async (c) => {
       // Cold or too stale to trust — the one unavoidable slow fetch.
       results = await fetchAndCache(key, lat, lng, radius_km);
     }
-    const enriched = await enrichWithRatings(results, lat, lng);
-    return c.json({ places: await withSponsoredExtras(enriched, lat, lng) });
+    return c.json({ places: await nearbyPayload(results, lat, lng) });
   } catch (e) {
     // Upstream dead but we have *some* cache → serve it rather than 502.
     if (cached) {
-      const enriched = await enrichWithRatings(cached.places, lat, lng);
-      return c.json({ places: await withSponsoredExtras(enriched, lat, lng), stale: true });
+      return c.json({ places: await nearbyPayload(cached.places, lat, lng), stale: true });
     }
     throw new AppError(502, 'UPSTREAM_ERROR', 'OpenStreetMap query failed');
   }

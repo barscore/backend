@@ -6,6 +6,7 @@ import { AppError } from '../middleware/errorHandler.js';
 import { audit } from '../lib/audit.js';
 import { isPlus } from '../lib/plus.js';
 import { notify } from '../lib/notify.js';
+import { assertCleanText } from '../lib/textFilter.js';
 import {
   createRatingSchema,
   updateRatingSchema,
@@ -68,6 +69,7 @@ ratings.post('/', requireAuth, async (c) => {
   const barId = uuidParam(c);
   const user = c.get('user');
   const body = createRatingSchema.parse(await c.req.json());
+  assertCleanText(body.commento);
   await assertRatingsEnabled();
   await assertBarExists(barId);
 
@@ -91,6 +93,7 @@ ratings.put('/:rid', requireAuth, async (c) => {
   const rid = uuidParam(c, 'rid');
   const user = c.get('user');
   const body = updateRatingSchema.parse(await c.req.json());
+  assertCleanText(body.commento);
   await assertRatingsEnabled();
 
   const { data: existing } = await supabase
@@ -202,6 +205,7 @@ ratings.put('/:rid/reply', requireAuth, async (c) => {
   const rid = uuidParam(c, 'rid');
   const user = c.get('user');
   const { risposta } = replyRatingSchema.parse(await c.req.json());
+  assertCleanText(risposta);
   await assertRatingsEnabled();
 
   const { bar, rating } = await loadReplyTarget(barId, rid);

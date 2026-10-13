@@ -2,7 +2,10 @@ import { Hono } from 'hono';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { tick } from '../lib/reminderWorker.js';
 import { supabase } from '../lib/supabase.js';
+import { pruneShared } from '../lib/nearbyStore.js';
 import { AppError } from '../middleware/errorHandler.js';
+
+const NEARBY_SHARED_MAX_AGE_MS = Number(process.env.NEARBY_CACHE_MAX_AGE_MS) || 7 * 24 * 60 * 60 * 1000;
 
 // Lavori pianificati, chiamati da uno scheduler ESTERNO (pg_cron + pg_net su
 // Supabase). Non c'è auth Supabase: il chiamante è una macchina, non un utente,
@@ -50,7 +53,12 @@ cron.post('/reminders', async (c) => {
   const { data: pruned, error } = await supabase.rpc('prune_rate_limits');
   if (error) console.error('[cron] prune_rate_limits fallita:', error.message);
 
-  return c.json({ ok: true, reminded, pruned: error ? null : (pruned ?? 0) });
+  // Stesso discorso per la cache condivisa dei luoghi: oltre la finestra in cui
+  // viene ancora servita (7 giorni, come in routes/places.js) una voce è solo
+  // spazio occupato.
+  const nearbyPruned = await pruneShared(NEARBY_SHARED_MAX_AGE_MS);
+
+  return c.json({ ok: true, reminded, pruned: error ? null : (pruned ?? 0), nearby_pruned: nearbyPruned });
 });
 
 export default cron;

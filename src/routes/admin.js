@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { audit } from '../lib/audit.js';
+import { invalidateWriteSwitches } from '../lib/appSettings.js';
 import { notify } from '../lib/notify.js';
 import {
   listUsersQuerySchema,
@@ -405,6 +406,9 @@ admin.put('/settings', async (c) => {
     .select('registration_open, ratings_enabled, maintenance_mode, maintenance_reason, maintenance_eta, beta_mode, updated_at')
     .single();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update settings');
+  // The gate keeps the switches in memory for a few seconds: forget them, so
+  // whoever flips one sees it take effect on their very next request.
+  invalidateWriteSwitches();
 
   await audit(c.get('user').id, 'settings.update', {
     targetType: 'app_settings',

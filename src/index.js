@@ -6,7 +6,8 @@ import { logger } from 'hono/logger';
 import { secureHeaders } from 'hono/secure-headers';
 import { errorHandler, AppError } from './middleware/errorHandler.js';
 import { rateLimiter } from './middleware/rateLimiter.js';
-import { supabase } from './lib/supabase.js';
+import { getWriteSwitches } from './lib/appSettings.js';
+import { lookupCaller } from './middleware/auth.js';
 import barRoutes from './routes/bars.js';
 import placeRoutes from './routes/places.js';
 import bookmarkRoutes from './routes/bookmarks.js';
@@ -105,11 +106,8 @@ app.use('*', async (c, next) => {
   // questa eccezione in beta nessuno (admin compresi) entra con lo username.
   if (c.req.path === '/auth/login') return next();
 
-  const { data: settings } = await supabase
-    .from('app_settings')
-    .select('maintenance_mode, beta_mode')
-    .eq('id', 1)
-    .maybeSingle();
+  // Cached for a few seconds (lib/appSettings.js): this runs on every write.
+  const settings = await getWriteSwitches();
 
   if (settings?.maintenance_mode) {
     throw new AppError(503, 'MAINTENANCE', 'Sito in manutenzione — scritture disabilitate');
@@ -117,21 +115,11 @@ app.use('*', async (c, next) => {
 
   if (settings?.beta_mode) {
     // Resolve the caller's role from the Bearer token (best-effort: anonymous
-    // or invalid token simply means no role → blocked).
-    const [scheme, token] = (c.req.header('Authorization') || '').split(' ');
-    let role = null;
-    if (scheme === 'Bearer' && token) {
-      const { data: auth } = await supabase.auth.getUser(token);
-      if (auth?.user) {
-        const { data: prof } = await supabase
-          .from('profiles')
-          .select('role')
-          .eq('id', auth.user.id)
-          .maybeSingle();
-        role = prof?.role ?? null;
-      }
-    }
-    if (!BETA_ROLES.includes(role)) {
+    // or invalid token simply means no role → blocked). lookupCaller leaves
+    // what it found on the context, so requireAuth doesn't ask Supabase the
+    // same two questions again a moment later.
+    const caller = await lookupCaller(c);
+    if (!BETA_ROLES.includes(caller?.prof?.role ?? null)) {
       throw new AppError(503, 'BETA', 'Beta test in corso — accesso riservato ai beta tester');
     }
   }

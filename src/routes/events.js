@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
+import { assertCleanText } from '../lib/textFilter.js';
 import {
   nearbyEventsQuerySchema,
   createEventSchema,
@@ -140,6 +141,7 @@ events.post(
   sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'event-create' }),
   async (c) => {
     const body = createEventSchema.parse(await c.req.json());
+    assertCleanText(body.title, body.description);
     const user = c.get('user');
 
     let { lat, lng } = body;
@@ -201,6 +203,7 @@ events.post(
 events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), async (c) => {
   const id = uuidParam(c);
   const body = updateEventSchema.parse(await c.req.json());
+  assertCleanText(body.title, body.description);
   const user = c.get('user');
 
   const { data: existing } = await supabase

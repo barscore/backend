@@ -1,6 +1,32 @@
 import { supabase } from '../lib/supabase.js';
 import { AppError } from './errorHandler.js';
 
+// Who is calling: the token's user and their profile row, or null when there
+// is no valid Bearer token. The result is kept on the request context, keyed
+// by the token it was resolved for — the beta gate (index.js) and requireAuth
+// both need it, and on a write in beta mode that used to be the same two
+// Supabase round-trips twice in a row.
+export async function lookupCaller(c) {
+  const [scheme, token] = (c.req.header('Authorization') || '').split(' ');
+  if (scheme !== 'Bearer' || !token) return null;
+
+  const known = c.get('caller');
+  if (known?.token === token) return known;
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+
+  const { data: prof } = await supabase
+    .from('profiles')
+    .select('role, banned, suspended_until')
+    .eq('id', data.user.id)
+    .maybeSingle();
+
+  const caller = { token, user: data.user, prof };
+  c.set('caller', caller);
+  return caller;
+}
+
 // Verifies the Supabase access token (Bearer) and attaches the user to context.
 // Works for email/password and OAuth (Google) sessions alike.
 export async function requireAuth(c, next) {
@@ -11,8 +37,8 @@ export async function requireAuth(c, next) {
     throw new AppError(401, 'UNAUTHORIZED', 'Missing or malformed Authorization header');
   }
 
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) {
+  const caller = await lookupCaller(c);
+  if (!caller) {
     throw new AppError(401, 'UNAUTHORIZED', 'Invalid or expired access token');
   }
 
@@ -20,11 +46,7 @@ export async function requireAuth(c, next) {
   // users are locked out until suspended_until passes. Role stays lazy
   // (loaded by requireRole), but we already touch profiles here for the ban
   // check, so cache it on context to save requireRole a round-trip.
-  const { data: prof } = await supabase
-    .from('profiles')
-    .select('role, banned, suspended_until')
-    .eq('id', data.user.id)
-    .maybeSingle();
+  const { user, prof } = caller;
 
   if (prof?.banned) {
     throw new AppError(403, 'BANNED', 'Account bannato');
@@ -37,7 +59,7 @@ export async function requireAuth(c, next) {
     );
   }
 
-  c.set('user', { id: data.user.id, email: data.user.email, role: prof?.role });
+  c.set('user', { id: user.id, email: user.email, role: prof?.role });
   await next();
 }
 
