@@ -11,12 +11,16 @@ import { sanitizeHttpUrl } from './url.js';
 // once and take the first HTTP 200 — bounding latency to the fastest healthy
 // mirror instead of summing timeouts. Override with a comma-separated
 // OVERPASS_URL.
+// VK's instance (maps.mail.ru) is the one that stayed up on 2026-10-14, when
+// the other three all 504'd or hung for a whole morning: with only those three
+// every area not already cached came back 502.
 const OVERPASS_URLS = (process.env.OVERPASS_URL
   ? process.env.OVERPASS_URL.split(',').map((s) => s.trim()).filter(Boolean)
   : [
       'https://overpass.private.coffee/api/interpreter',
       'https://overpass-api.de/api/interpreter',
       'https://overpass.kumi.systems/api/interpreter',
+      'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
     ]);
 const NOMINATIM_URL = process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org';
 const UA = process.env.OSM_USER_AGENT || 'rabar/1.0 (https://github.com/rabar; contact: martino.parisi@rabar.it)';
@@ -33,14 +37,27 @@ async function overpassFetch(query, timeoutMs = OVERPASS_TIMEOUT_MS) {
     const attempts = OVERPASS_URLS.map((url, i) => {
       const ctrl = controllers[i];
       timers.push(setTimeout(() => ctrl.abort(), timeoutMs));
-      return fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain', 'User-Agent': UA },
-        body: query,
-        signal: ctrl.signal,
-      }).then(async (res) => {
-        if (!res.ok) throw new Error(`Overpass ${res.status} (${url})`);
-        return res.json();
+      const once = () =>
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain', 'User-Agent': UA },
+          body: query,
+          signal: ctrl.signal,
+        }).then(async (res) => {
+          if (!res.ok) {
+            res.body?.cancel().catch(() => {});
+            throw new Error(`Overpass ${res.status} (${url})`);
+          }
+          return res.json();
+        });
+      // A mirror that refuses at once (504 "too busy", 429) is often free again
+      // a couple of seconds later, while the others may hang for the whole
+      // timeout: one retry of the quick refusals, within the same budget.
+      const started = Date.now();
+      return once().catch(async (e) => {
+        if (ctrl.signal.aborted || Date.now() - started > 10_000) throw e;
+        await new Promise((r) => setTimeout(r, 2000));
+        return once();
       });
     });
     // Promise.any → first fulfilled wins; rejects only if ALL fail.

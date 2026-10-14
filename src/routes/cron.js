@@ -1,8 +1,10 @@
 import { Hono } from 'hono';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { tick } from '../lib/reminderWorker.js';
 import { supabase } from '../lib/supabase.js';
 import { pruneShared } from '../lib/nearbyStore.js';
+import { sameSecret } from '../lib/secret.js';
+import { googlePlayConfigured } from '../lib/googlePlay.js';
+import { syncGoogleSubscription } from '../lib/plus.js';
 import { AppError } from '../middleware/errorHandler.js';
 
 const NEARBY_SHARED_MAX_AGE_MS = Number(process.env.NEARBY_CACHE_MAX_AGE_MS) || 7 * 24 * 60 * 60 * 1000;
@@ -17,24 +19,51 @@ const NEARBY_SHARED_MAX_AGE_MS = Number(process.env.NEARBY_CACHE_MAX_AGE_MS) || 
 // tutti i promemoria arretrati in una volta.
 const cron = new Hono();
 
+/** CRON_SECRET, confrontato a tempo costante (lib/secret.js). */
+const secretOk = (given) => sameSecret(given, process.env.CRON_SECRET);
+
 /**
- * Confronto a tempo costante. `!==` esce al primo byte diverso e il tempo di
- * risposta racconta quanti byte erano giusti: con un endpoint che si può
- * chiamare quanto si vuole, è un segreto che si indovina un carattere alla
- * volta.
+ * Abbonamenti Google Play arrivati a fine periodo senza notizie.
  *
- * Si confrontano gli SHA-256, non i byte: `timingSafeEqual` pretende due buffer
- * della stessa lunghezza, e la guardia `a.length === b.length` che serve a non
- * farlo lanciare è essa stessa un canale — esce prima, e chi prova capisce che
- * la lunghezza indovinata era sbagliata. I digest sono sempre 32 byte, quindi
- * non lancia mai e la lunghezza del segreto non trapela.
+ * I rinnovi arrivano dalle notifiche in tempo reale (routes/googlePlay.js), ma
+ * se il topic Pub/Sub non è configurato — o una notifica si perde — chi ha
+ * rinnovato resterebbe senza rabar+ fino al prossimo avvio dell'app. Qui si
+ * rilegge da Google lo stato di chi risulta attivo con il periodo già scaduto:
+ * rinnovato ⇒ nuova scadenza, scaduto ⇒ `canceled` e fuori da questa lista.
+ * Pochi per giro: il cron passa ogni pochi minuti. Best-effort.
  */
-function secretOk(given) {
-  const expected = process.env.CRON_SECRET;
-  if (!expected || !given) return false;
-  const a = createHash('sha256').update(given).digest();
-  const b = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(a, b);
+async function refreshLapsedGoogle() {
+  if (!googlePlayConfigured()) return 0;
+  const { data: rows, error } = await supabase
+    .from('plus_subscriptions')
+    .select('google_purchase_token')
+    .eq('provider', 'google')
+    .in('status', ['active', 'past_due'])
+    .lt('current_period_end', new Date().toISOString())
+    .not('google_purchase_token', 'is', null)
+    .limit(10);
+  if (error) {
+    console.error('[cron] abbonamenti Google non letti:', error.message);
+    return 0;
+  }
+  let done = 0;
+  for (const row of rows ?? []) {
+    try {
+      const synced = await syncGoogleSubscription(row.google_purchase_token);
+      // Token che Google non conosce più (scaduto da tempo): non c'è niente da
+      // rinnovare, e senza chiuderlo qui tornerebbe in lista a ogni giro.
+      if (!synced) {
+        await supabase
+          .from('plus_subscriptions')
+          .update({ status: 'canceled', updated_at: new Date().toISOString() })
+          .eq('google_purchase_token', row.google_purchase_token);
+      }
+      done++;
+    } catch (e) {
+      console.error('[cron] refresh Google non riuscito:', e.message);
+    }
+  }
+  return done;
 }
 
 /** POST /cron/reminders — un giro di promemoria eventi (~3h prima dell'inizio). */
@@ -58,7 +87,15 @@ cron.post('/reminders', async (c) => {
   // spazio occupato.
   const nearbyPruned = await pruneShared(NEARBY_SHARED_MAX_AGE_MS);
 
-  return c.json({ ok: true, reminded, pruned: error ? null : (pruned ?? 0), nearby_pruned: nearbyPruned });
+  const googleRefreshed = await refreshLapsedGoogle();
+
+  return c.json({
+    ok: true,
+    reminded,
+    pruned: error ? null : (pruned ?? 0),
+    nearby_pruned: nearbyPruned,
+    google_refreshed: googleRefreshed,
+  });
 });
 
 export default cron;

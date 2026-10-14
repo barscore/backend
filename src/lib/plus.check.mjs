@@ -4,7 +4,7 @@
 //
 //   SUPABASE_URL=x SUPABASE_SERVICE_ROLE_KEY=x node src/lib/plus.check.mjs
 import assert from 'node:assert/strict';
-import { PLANS, isPlus, periodEnd } from './plus.js';
+import { PLANS, googleMayWrite, isPlus, periodEnd } from './plus.js';
 
 // Listino: i default sono i prezzi annunciati agli utenti.
 assert.equal(PLANS.week.amount_cents, 199);
@@ -28,5 +28,16 @@ const ts = Math.floor(Date.parse(iso) / 1000);
 assert.equal(periodEnd({ current_period_end: ts }), iso);
 assert.equal(periodEnd({ items: { data: [{ current_period_end: ts }] } }), iso);
 assert.equal(periodEnd({}), null);
+
+// Google Play: un acquisto vivo scrive sempre; uno morto chiude solo la
+// riga che segue proprio quel token, e mai uno Stripe ancora attivo.
+const live = { entitled: true };
+const dead = { entitled: false };
+assert.equal(googleMayWrite(null, 't1', dead), true);
+assert.equal(googleMayWrite({ provider: 'stripe', status: 'active' }, 't1', live), true);
+assert.equal(googleMayWrite({ provider: 'stripe', status: 'active' }, 't1', dead), false);
+assert.equal(googleMayWrite({ provider: 'stripe', status: 'canceled' }, 't1', dead), true);
+assert.equal(googleMayWrite({ provider: 'google', google_purchase_token: 't1' }, 't1', dead), true);
+assert.equal(googleMayWrite({ provider: 'google', google_purchase_token: 't2' }, 't1', dead), false);
 
 console.log('plus: ok');

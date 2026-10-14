@@ -36,3 +36,22 @@ export const appleOrderSchema = targetSchema;
 export const appleVerifySchema = z.object({
   signed_transaction: z.string().min(20).max(20_000),
 });
+
+/**
+ * POST /boosts/google/order — tier + target, no radius: Play products have a
+ * fixed price (see routes/boosts.js).
+ */
+export const googleOrderSchema = z
+  .object({
+    tier,
+    event_id: z.string().uuid().optional(),
+    bar_id: z.string().uuid().optional(),
+  })
+  .refine(oneTarget, oneTargetMessage);
+
+/** POST /boosts/google/verify — what Google Play handed the app. */
+export const googleVerifySchema = z.object({
+  order_id: z.string().uuid(),
+  product_id: z.string().min(1).max(100),
+  purchase_token: z.string().min(10).max(4096),
+});

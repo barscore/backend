@@ -1,5 +1,12 @@
 import { supabase } from './supabase.js';
 import { issueFreeDrinkToken } from './freeDrink.js';
+import {
+  PLUS_PRODUCT_ID,
+  acknowledgeSubscription,
+  getSubscription,
+  readSubscription,
+  statusFor,
+} from './googlePlay.js';
 
 /**
  * rabar+ — piani di abbonamento.
@@ -66,6 +73,18 @@ export async function syncSubscription(sub, { userId } = {}) {
   const end = periodEnd(sub);
   const plan = sub?.metadata?.plan ?? null;
 
+  // Una sola riga per utente: chi è passato a Google Play dopo un vecchio
+  // abbonamento Stripe non deve vedersi chiudere quello buono dall'ultimo
+  // evento (`deleted`, `updated`) dell'abbonamento morto.
+  if (!ACTIVE_STATUSES.has(sub.status)) {
+    const { data: row } = await supabase
+      .from('plus_subscriptions')
+      .select('provider')
+      .eq('user_id', uid)
+      .maybeSingle();
+    if (row?.provider === 'google') return { user_id: uid, status: sub.status, ignored: true };
+  }
+
   await supabase
     .from('plus_subscriptions')
     .upsert(
@@ -93,3 +112,92 @@ export async function syncSubscription(sub, { userId } = {}) {
 
   return { user_id: uid, status: sub.status, plus_until: end };
 }
+
+/**
+ * Se un abbonamento Google Play letto adesso può scrivere sulla riga dell'utente.
+ *
+ * Un acquisto vivo vince sempre. Uno scaduto, revocato o sospeso può chiudere
+ * solo l'abbonamento che la riga sta seguendo: non uno Stripe ancora attivo, né
+ * quello Google che lo ha sostituito (cambio piano ⇒ token nuovo, e le notifiche
+ * del vecchio continuano ad arrivare).
+ */
+export function googleMayWrite(row, token, { entitled }) {
+  if (entitled || !row) return true;
+  if (row.provider === 'google') return row.google_purchase_token === token;
+  return !ACTIVE_STATUSES.has(row.status);
+}
+
+export class PlusOwnershipError extends Error {}
+
+/**
+ * Allinea rabar+ a un abbonamento Google Play, letto dalla Developer API.
+ *
+ * Chiamata dall'app subito dopo l'acquisto e a ogni avvio (con `userId`, il
+ * chiamante), dalle notifiche in tempo reale di Google e dal cron (senza).
+ * L'utente è quello che l'app ha messo sull'acquisto
+ * (`obfuscatedAccountId`): un token comprato da un altro account, o già legato
+ * a un altro utente, non concede niente a chi lo presenta.
+ *
+ * Idempotente come syncSubscription: rilegge sempre lo stato vero da Google.
+ */
+export async function syncGoogleSubscription(token, { userId } = {}) {
+  const sub = await getSubscription(token);
+  const s = sub ? readSubscription(sub) : null;
+  if (!s) return null;
+
+  const { data: bound } = await supabase
+    .from('plus_subscriptions')
+    .select('user_id')
+    .eq('google_purchase_token', token)
+    .maybeSingle();
+
+  const uid = s.userId ?? bound?.user_id ?? userId ?? null;
+  if (!uid) return null;
+  if ((userId && uid !== userId) || (bound && bound.user_id !== uid)) {
+    throw new PlusOwnershipError('Acquisto legato a un altro account');
+  }
+
+  const { data: row } = await supabase
+    .from('plus_subscriptions')
+    .select('provider, status, google_purchase_token')
+    .eq('user_id', uid)
+    .maybeSingle();
+  if (!googleMayWrite(row, token, s)) return { user_id: uid, status: statusFor(s.state), ignored: true };
+
+  const { error } = await supabase.from('plus_subscriptions').upsert(
+    {
+      user_id: uid,
+      provider: 'google',
+      plan: s.plan,
+      status: statusFor(s.state),
+      google_purchase_token: token,
+      current_period_end: s.until,
+      cancel_at_period_end: !s.autoRenew,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'user_id' },
+  );
+  if (error) throw error;
+
+  // Scaduto o revocato: il diritto finisce adesso al più tardi, mai dopo.
+  const now = new Date().toISOString();
+  const until = s.entitled ? s.until : s.until && s.until < now ? s.until : now;
+  await supabase.from('profiles').update({ plus_until: until }).eq('id', uid);
+
+  if (s.entitled) {
+    await issueFreeDrinkToken(uid).catch((e) =>
+      console.error('[plus] free drink token non emesso:', e.message),
+    );
+    // Entro tre giorni, o Google rimborsa da solo. Dopo aver dato il diritto:
+    // un riconoscimento senza diritto sarebbe un incasso senza merce. Se
+    // fallisce, il prossimo avvio dell'app (o la prossima notifica) ci riprova.
+    if (!s.acknowledged) {
+      await acknowledgeSubscription(PLUS_PRODUCT_ID, token).catch((e) =>
+        console.error('[plus] acknowledge Google non riuscito:', e.message),
+      );
+    }
+  }
+
+  return { user_id: uid, status: statusFor(s.state), plus_until: until };
+}
+

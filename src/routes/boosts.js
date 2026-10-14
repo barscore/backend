@@ -15,7 +15,21 @@ import {
   SPONSOR_RADIUS_MAX_KM,
 } from '../lib/boostFulfillment.js';
 import { verifySignedTransaction } from '../lib/appleIap.js';
-import { appleOrderSchema, appleVerifySchema, boostCheckoutSchema } from '../schemas/boostSchemas.js';
+import {
+  BOOST_PRODUCTS,
+  GooglePlayError,
+  consumeProduct,
+  getProduct,
+  googlePlayConfigured,
+  productPaid,
+} from '../lib/googlePlay.js';
+import {
+  appleOrderSchema,
+  appleVerifySchema,
+  boostCheckoutSchema,
+  googleOrderSchema,
+  googleVerifySchema,
+} from '../schemas/boostSchemas.js';
 
 // Paid visibility boosts. Prices are server-side only (env), the client sends
 // just tier + target. Inline price_data ⇒ no products to manage in the Stripe
@@ -238,6 +252,152 @@ boosts.post('/apple/verify', requireAuth, async (c) => {
   await applyBoost(paid);
   return c.json({ order: paid });
 });
+
+// ---------------------------------------------------------------------------
+// Google Play (Android client)
+//
+// Same shape as the Apple path: the order is opened here first, where the
+// ownership gate runs before anyone is charged, and its id travels on the
+// purchase as the obfuscated profile id. The three Play products have a fixed
+// price, so an Android boost carries no extra radius: the radius is priced per
+// km and a fixed-price product could only give it away.
+// ---------------------------------------------------------------------------
+
+const ORDER_FIELDS = 'id, status, tier, event_id, bar_id, paid_at';
+
+/** POST /boosts/google/order — open a pending order for a Play purchase. */
+boosts.post(
+  '/google/order',
+  requireAuth,
+  requireRole('organizer'),
+  sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'boost-order' }),
+  async (c) => {
+    if (!googlePlayConfigured()) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
+    const user = c.get('user');
+    const { tier, event_id, bar_id } = googleOrderSchema.parse(await c.req.json());
+    const t = TIERS[tier];
+
+    await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
+
+    const { data: order, error } = await supabase
+      .from('boost_orders')
+      .insert({
+        user_id: user.id,
+        event_id: event_id ?? null,
+        bar_id: bar_id ?? null,
+        tier,
+        // What the server price list says; Google bills the price set on the
+        // product in Play Console, which is the one the app shows.
+        amount_cents: t.amount_cents,
+        provider: 'google',
+      })
+      .select('id')
+      .single();
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Creazione ordine non riuscita');
+
+    return c.json({ order_id: order.id, product_id: BOOST_PRODUCTS[tier] });
+  },
+);
+
+/**
+ * POST /boosts/google/verify — read the purchase back from Google and fulfil.
+ *
+ * Idempotent like the Apple path: the pending→paid update filters on status and
+ * `google_purchase_token` is uniquely indexed, so the app retrying (or finding
+ * the same unconsumed purchase at the next launch) gets the paid order back
+ * instead of a second boost. Consuming happens here, after the grant, so a
+ * purchase Google charged is never left without its boost.
+ */
+boosts.post(
+  '/google/verify',
+  requireAuth,
+  sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'boost-google' }),
+  async (c) => {
+    if (!googlePlayConfigured()) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
+    const user = c.get('user');
+    const { order_id, product_id, purchase_token } = googleVerifySchema.parse(await c.req.json());
+
+    const consume = () =>
+      consumeProduct(product_id, purchase_token).catch((e) =>
+        console.error('[boosts] consume Google non riuscito:', e.message),
+      );
+
+    const { data: seen } = await supabase
+      .from('boost_orders')
+      .select(`${ORDER_FIELDS}, user_id`)
+      .eq('google_purchase_token', purchase_token)
+      .maybeSingle();
+    if (seen) {
+      if (seen.user_id !== user.id) throw new AppError(404, 'NOT_FOUND', 'Ordine non trovato');
+      await consume();
+      const { user_id: _owner, ...order } = seen;
+      return c.json({ order });
+    }
+
+    const { data: order } = await supabase
+      .from('boost_orders')
+      .select('id, user_id, tier, status')
+      .eq('id', order_id)
+      .maybeSingle();
+    if (!order || order.user_id !== user.id) {
+      throw new AppError(404, 'NOT_FOUND', 'Ordine non trovato');
+    }
+    // A 3-day product must not settle a 30-day order.
+    if (product_id !== BOOST_PRODUCTS[order.tier]) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Prodotto non corrispondente all’ordine');
+    }
+
+    let purchase;
+    try {
+      purchase = await getProduct(product_id, purchase_token);
+    } catch (e) {
+      if (e instanceof GooglePlayError) throw new AppError(e.status, 'UNAVAILABLE', 'Google Play non raggiungibile');
+      throw e;
+    }
+    if (!purchase) throw new AppError(400, 'VALIDATION_ERROR', 'Acquisto Google Play non valido');
+
+    // The app stamps both ids on the purchase: a token bought for another order
+    // or by another account settles nothing here.
+    if (
+      (purchase.obfuscatedExternalProfileId && purchase.obfuscatedExternalProfileId !== order.id) ||
+      (purchase.obfuscatedExternalAccountId && purchase.obfuscatedExternalAccountId !== user.id)
+    ) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Acquisto non corrispondente all’ordine');
+    }
+    // Pending (e.g. cash at a shop): nothing yet. Play tells the app when it
+    // completes, and the app comes back here.
+    if (purchase.purchaseState === 2) return c.json({ order: { id: order.id, status: 'pending' } }, 202);
+    if (!productPaid(purchase)) throw new AppError(400, 'VALIDATION_ERROR', 'Acquisto annullato');
+
+    const { data: paid } = await supabase
+      .from('boost_orders')
+      .update({
+        status: 'paid',
+        paid_at: new Date().toISOString(),
+        google_purchase_token: purchase_token,
+        google_order_id: purchase.orderId ?? null,
+      })
+      .eq('id', order.id)
+      .eq('status', 'pending')
+      .select(`${ORDER_FIELDS}, sponsor_radius_km`)
+      .maybeSingle();
+
+    if (!paid) {
+      // Lost the race against a concurrent verification of the same order.
+      const { data: current } = await supabase
+        .from('boost_orders')
+        .select(ORDER_FIELDS)
+        .eq('id', order.id)
+        .maybeSingle();
+      return c.json({ order: current });
+    }
+
+    await applyBoost(paid);
+    await consume();
+    const { sponsor_radius_km: _radius, ...out } = paid;
+    return c.json({ order: out });
+  },
+);
 
 /** GET /boosts/order/:id — order status for the purchase result screen. */
 boosts.get('/order/:id', requireAuth, async (c) => {

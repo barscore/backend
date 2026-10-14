@@ -27,6 +27,7 @@ import pushRoutes from './routes/push.js';
 import boostRoutes from './routes/boosts.js';
 import plusRoutes from './routes/plus.js';
 import stripeWebhookRoutes from './routes/stripeWebhook.js';
+import googlePlayRoutes from './routes/googlePlay.js';
 import cronRoutes from './routes/cron.js';
 import authRoutes from './routes/auth.js';
 
@@ -99,6 +100,8 @@ app.use('*', async (c, next) => {
   if (c.req.path.startsWith('/admin')) return next();
   // Stripe retries must land even in maintenance (signature-verified anyway).
   if (c.req.path === '/stripe/webhook') return next();
+  // Google Play's notifications the same (shared token in the URL).
+  if (c.req.path === '/google-play/rtdn') return next();
   // Same for the scheduler: it authenticates with CRON_SECRET, has no Bearer
   // token, and beta_mode would otherwise silently stop every reminder.
   if (c.req.path.startsWith('/cron/')) return next();
@@ -145,6 +148,7 @@ app.route('/push', pushRoutes);
 app.route('/boosts', boostRoutes);
 app.route('/plus', plusRoutes);
 app.route('/stripe', stripeWebhookRoutes);
+app.route('/google-play', googlePlayRoutes);
 app.route('/cron', cronRoutes);
 app.route('/auth', authRoutes);
 

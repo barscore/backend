@@ -3,8 +3,10 @@ import Stripe from 'stripe';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
-import { PLANS, isPlus } from '../lib/plus.js';
-import { plusCheckoutSchema } from '../schemas/plusSchemas.js';
+import { PLANS, PlusOwnershipError, isPlus, syncGoogleSubscription } from '../lib/plus.js';
+import { googlePlayConfigured, GooglePlayError } from '../lib/googlePlay.js';
+import { sharedRateLimiter } from '../middleware/rateLimiter.js';
+import { plusCheckoutSchema, plusGoogleVerifySchema } from '../schemas/plusSchemas.js';
 
 // rabar+ — abbonamento (badge "+", tutti i temi, niente pubblicità).
 // Come per i boost: i prezzi sono solo server-side, la sottoscrizione viene
@@ -37,7 +39,7 @@ plus.get('/status', requireAuth, async (c) => {
 
   const { data: sub } = await supabase
     .from('plus_subscriptions')
-    .select('plan, status, current_period_end, cancel_at_period_end')
+    .select('provider, plan, status, current_period_end, cancel_at_period_end')
     .eq('user_id', user.id)
     .maybeSingle();
 
@@ -143,5 +145,46 @@ plus.post('/portal', requireAuth, async (c) => {
 
   return c.json({ url: portal.url });
 });
+
+// ---------------------------------------------------------------------------
+// Google Play (app Android)
+//
+// Sul Play Store rabar+ si compra con Google Play Billing: Stripe non è ammesso
+// per una funzione usata dentro l'app. L'app manda il token dell'acquisto; il
+// diritto lo decide quello che risponde Google (lib/plus.js →
+// syncGoogleSubscription), mai il client.
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /plus/google/verify — dopo l'acquisto e a ogni avvio dell'app, per
+ * ciascun abbonamento che Google Play le restituisce. Idempotente.
+ */
+plus.post(
+  '/google/verify',
+  requireAuth,
+  sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'plus-google' }),
+  async (c) => {
+    if (!googlePlayConfigured()) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
+    const user = c.get('user');
+    const { purchase_token } = plusGoogleVerifySchema.parse(await c.req.json());
+
+    let result;
+    try {
+      result = await syncGoogleSubscription(purchase_token, { userId: user.id });
+    } catch (e) {
+      if (e instanceof PlusOwnershipError) throw new AppError(403, 'FORBIDDEN', e.message);
+      if (e instanceof GooglePlayError) throw new AppError(e.status, 'UNAVAILABLE', 'Google Play non raggiungibile');
+      throw e;
+    }
+    if (!result) throw new AppError(400, 'VALIDATION_ERROR', 'Acquisto Google Play non valido');
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('plus_until')
+      .eq('id', user.id)
+      .maybeSingle();
+    return c.json({ plus: isPlus(profile), plus_until: profile?.plus_until ?? null });
+  },
+);
 
 export default plus;

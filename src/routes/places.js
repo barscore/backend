@@ -26,6 +26,9 @@ const places = new Hono();
 const NEARBY_TTL_MS = Number(process.env.NEARBY_CACHE_TTL_MS) || 30 * 60 * 1000; // fresh window
 const NEARBY_MAX_AGE_MS = Number(process.env.NEARBY_CACHE_MAX_AGE_MS) || 7 * 24 * 60 * 60 * 1000; // serve-stale window
 const NEARBY_CACHE_MAX = 2000;
+// How long a cold request waits on Overpass before falling back to the bars in
+// our own table. Below the clients' own timeouts (60 s on the apps).
+const COLD_FALLBACK_MS = Number(process.env.NEARBY_COLD_FALLBACK_MS) || 25 * 1000;
 // On Vercel the bundle filesystem is read-only — only /tmp is writable (and it
 // survives between requests on the same warm instance, which is what this cache
 // wants). Locally it stays next to the repo so `--watch` reloads keep it.
@@ -206,6 +209,38 @@ async function nearbySponsored(lat, lng) {
 }
 
 /**
+ * Last resort when Overpass is down and nothing is cached for the area: the
+ * bars already in our own table, shaped like OSM places. It is only the venues
+ * somebody has opened, rated or claimed — not the whole map — but those are the
+ * ones with something to show, and a short list beats a 502: on 2026-10-14 every
+ * public mirror 504'd for a morning and every client showed "no bars".
+ */
+async function nearbyFromDb(lat, lng, radiusKm) {
+  const { data, error } = await withinBbox(
+    supabase
+      .from('bars')
+      .select('osm_node_id, name, address, city, lat, lng, phone, website, opening_hours, cover_image_url')
+      .eq('is_active', true)
+      // Same contract as the sponsored extras: a place without an OSM node has
+      // no key on the clients.
+      .not('osm_node_id', 'is', null),
+    bboxAround(lat, lng, radiusKm),
+  ).limit(2000);
+  if (error) {
+    console.error('[places] ripiego dal database fallito:', error.message);
+    return [];
+  }
+  return (data ?? [])
+    .filter((b) => haversineKm(lat, lng, b.lat, b.lng) <= radiusKm)
+    .map((b) => ({
+      ...b,
+      osm_type: 'node',
+      // `opening_hours` is JSONB on `bars`; the clients read the raw OSM string.
+      opening_hours: typeof b.opening_hours === 'string' ? b.opening_hours : null,
+    }));
+}
+
+/**
  * The /nearby payload: OSM places with their ratings, plus the out-of-radius
  * sponsored bars in front. The two reads don't depend on each other, so they
  * run together. A sponsored bar the viewer is *also* near stays where it is
@@ -261,6 +296,8 @@ places.get('/nearby', async (c) => {
     }
   }
 
+  // Read at most once per request: the cold path may already have asked.
+  let fromDb = null;
   try {
     let results;
     if (cached && age < NEARBY_MAX_AGE_MS) {
@@ -269,14 +306,37 @@ places.get('/nearby', async (c) => {
       results = cached.places;
       if (age > NEARBY_TTL_MS) fetchAndCache(key, lat, lng, radius_km).catch(() => {});
     } else {
-      // Cold or too stale to trust — the one unavoidable slow fetch.
-      results = await fetchAndCache(key, lat, lng, radius_km);
+      // Cold or too stale to trust — the one unavoidable slow fetch. With
+      // both attempts it can run past 80 s, longer than any client waits; past
+      // COLD_FALLBACK_MS the area's bars from our own table go out instead,
+      // while Overpass keeps going and fills the cache for the next request.
+      const upstream = fetchAndCache(key, lat, lng, radius_km);
+      let timer;
+      results = await Promise.race([
+        upstream,
+        new Promise((r) => { timer = setTimeout(() => r(null), COLD_FALLBACK_MS); }),
+      ]).finally(() => clearTimeout(timer));
+      if (results === null) {
+        fromDb = await nearbyFromDb(lat, lng, radius_km);
+        if (fromDb.length) {
+          upstream.catch(() => {});
+          return c.json({ places: await nearbyPayload(fromDb, lat, lng), stale: true });
+        }
+        results = await upstream;
+      }
     }
     return c.json({ places: await nearbyPayload(results, lat, lng) });
   } catch (e) {
     // Upstream dead but we have *some* cache → serve it rather than 502.
     if (cached) {
       return c.json({ places: await nearbyPayload(cached.places, lat, lng), stale: true });
+    }
+    // No cache either: what our own table knows about the area. Not cached —
+    // the next request should try Overpass again, not inherit a partial list.
+    console.error('[places] Overpass non raggiungibile, ripiego dal database:', e.message);
+    fromDb ??= await nearbyFromDb(lat, lng, radius_km);
+    if (fromDb.length) {
+      return c.json({ places: await nearbyPayload(fromDb, lat, lng), stale: true });
     }
     throw new AppError(502, 'UPSTREAM_ERROR', 'OpenStreetMap query failed');
   }
