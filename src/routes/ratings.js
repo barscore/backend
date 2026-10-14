@@ -46,7 +46,10 @@ ratings.get('/', async (c) => {
 
   const { data, error, count } = await supabase
     .from('ratings')
-    .select('id, prezzo, qualita_drinks, socialita, varieta, orari, commento, risposta, risposta_at, created_at, profiles(username, avatar_url, plus_until, is_explorer)', {
+    // user_id: chi legge una recensione deve poterne segnalare e bloccare
+    // l'autore da lì (policy UGC di Google Play, App Store 1.2) e aprirne il
+    // profilo. È lo stesso id già pubblico di GET /users/:id.
+    .select('id, user_id, prezzo, qualita_drinks, socialita, varieta, orari, commento, risposta, risposta_at, created_at, profiles(username, avatar_url, plus_until, is_explorer)', {
       count: 'exact',
     })
     .eq('bar_id', barId)
