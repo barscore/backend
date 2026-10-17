@@ -5,6 +5,9 @@ import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { isPlus } from '../lib/plus.js';
 import { issueFreeDrinkToken } from '../lib/freeDrink.js';
+import { assertCleanText } from '../lib/textFilter.js';
+import { assertModerated, identityText } from '../lib/moderation.js';
+import { markUsernameModerated, reviewUsername } from '../lib/usernameReview.js';
 import { myDrinkVotesQuerySchema } from '../schemas/drinkSchemas.js';
 import {
   createOrganizerRequestSchema,
@@ -33,10 +36,13 @@ me.get('/', async (c) => {
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load profile');
   if (!profile) throw new AppError(404, 'NOT_FOUND', 'Profile not found');
 
-  const { count } = await supabase
-    .from('ratings')
-    .select('id', { count: 'exact', head: true })
-    .eq('user_id', user.id);
+  const [username, { count }] = await Promise.all([
+    reviewUsername(c.get('caller').user, profile.username),
+    supabase
+      .from('ratings')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', user.id),
+  ]);
 
   // Each rating earns 10 ice cubes (accumulating points), derived from the
   // rating count — never stored, so it can't drift.
@@ -44,6 +50,7 @@ me.get('/', async (c) => {
   return c.json({
     profile: {
       ...profile,
+      username,
       email: user.email,
       ratings_count: ratingsCount,
       ice_cubes: ratingsCount * 10,
@@ -57,7 +64,13 @@ me.patch('/', async (c) => {
   const user = c.get('user');
   const { updateProfileSchema } = await import('../schemas/userSchemas.js');
   const body = updateProfileSchema.parse(await c.req.json());
-  
+  // Username e handle Instagram compaiono accanto a ogni contenuto pubblico.
+  assertCleanText(body.username, body.instagram_username);
+  const checked = await assertModerated(
+    [identityText(body.username), identityText(body.instagram_username)],
+    { policy: 'identity' },
+  );
+
   const { data, error } = await supabase
     .from('profiles')
     .update(body)
@@ -71,6 +84,8 @@ me.patch('/', async (c) => {
     }
     throw new AppError(500, 'INTERNAL_ERROR', 'Could not update profile');
   }
+  // Già controllato qui: la prossima GET /me non deve rifarlo.
+  if (checked && body.username) await markUsernameModerated(user.id, data.username);
   return c.json({ profile: data });
 });
 
@@ -323,14 +338,14 @@ me.get('/events', async (c) => {
  * suoi (li ha caricati lui) e il path interno non è un suo dato, è il modo in
  * cui organizziamo il bucket. Il nome basta a sapere cosa era allegato a cosa.
  *
- * Limite stretto: la rotta apre otto query e serializza l'intera storia
+ * Limite stretto: la rotta apre nove query e serializza l'intera storia
  * dell'account, non è una GET qualsiasi.
  */
 me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' }), async (c) => {
   const user = c.get('user');
   const mine = (table, columns) => supabase.from(table).select(columns).eq('user_id', user.id);
 
-  const [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims] =
+  const [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims, barEvents] =
     await Promise.all([
       supabase
         .from('profiles')
@@ -355,11 +370,20 @@ me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' 
         'bar_claims',
         'id, bar_id, note, status, admin_note, created_at, reviewed_at, proof_files',
       ),
+      // Le interazioni con i bar fatte da loggato (statistiche dei locali).
+      mine('bar_events', 'bar_id, kind, source, created_at')
+        .order('created_at', { ascending: false })
+        .limit(10000),
     ]);
+
+  // Prima di add_bar_stats.sql la tabella non esiste: non c'è niente da
+  // esportare, e non è un export incompleto.
+  const noTable = (r) => ['42P01', 'PGRST205'].includes(r.error?.code);
+  if (noTable(barEvents)) barEvents.error = null;
 
   // Un export incompleto spacciato per completo è peggio di un errore: se anche
   // una sola query fallisce, fallisce tutto.
-  const parts = [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims];
+  const parts = [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims, barEvents];
   if (parts.some((r) => r.error) || !profile.data) {
     throw new AppError(500, 'INTERNAL_ERROR', 'Export non riuscito');
   }
@@ -381,6 +405,7 @@ me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' 
     notifications: notifications.data ?? [],
     organizer_requests: withFileNames(requests.data ?? []),
     claims: withFileNames(claims.data ?? []),
+    bar_interactions: barEvents.data ?? [],
   });
 });
 

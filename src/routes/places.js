@@ -254,7 +254,33 @@ async function nearbyPayload(osmPlaces, lat, lng) {
   const haveOsm = new Set(enriched.map((p) => String(p.osm_node_id)));
   const haveId = new Set(enriched.map((p) => p.id).filter(Boolean));
   const extras = sponsored.filter((b) => !haveId.has(b.id) && !haveOsm.has(String(b.osm_node_id)));
-  return extras.length ? [...extras, ...enriched] : enriched;
+  const payload = extras.length ? [...extras, ...enriched] : enriched;
+  await countImpressions(payload);
+  return payload;
+}
+
+// Quante volte un bar è uscito sulla mappa o nella lista: il numero «comparse»
+// delle statistiche del proprietario (add_bar_stats.sql). Solo i bar che
+// esistono nel nostro DB, gli altri non hanno un proprietario a cui mostrarlo.
+// Al massimo IMPRESSIONS_WAIT_MS di attesa: è un contatore, la mappa non deve
+// aspettarlo se il DB rallenta.
+const IMPRESSIONS_WAIT_MS = 400;
+let lastImpressionsLogAt = 0;
+
+function countImpressions(places) {
+  const ids = [...new Set(places.map((p) => p.id).filter(Boolean))].slice(0, 500);
+  if (!ids.length) return Promise.resolve();
+  const write = supabase.rpc('bump_bar_impressions', { p_bar_ids: ids }).then(({ error }) => {
+    if (error && Date.now() - lastImpressionsLogAt > 60_000) {
+      lastImpressionsLogAt = Date.now();
+      console.error('[places] comparse non contate:', error.message);
+    }
+  }, () => {});
+  let timer;
+  return Promise.race([
+    write,
+    new Promise((r) => { timer = setTimeout(r, IMPRESSIONS_WAIT_MS); }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 const nearbySchema = z.object({

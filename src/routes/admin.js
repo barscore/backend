@@ -47,13 +47,17 @@ admin.get('/stats', async (c) => {
   const nowIso = new Date().toISOString();
   const head = { count: 'exact', head: true };
 
-  const [users, ratings, bars, banned, suspended] = await Promise.all([
+  const [users, ratings, bars, banned, suspended, growth] = await Promise.all([
     supabase.from('profiles').select('id', head),
     supabase.from('ratings').select('id', head),
     supabase.from('bars').select('id', head),
     supabase.from('profiles').select('id', head).eq('banned', true),
     supabase.from('profiles').select('id', head).gt('suspended_until', nowIso),
+    // Nuovi iscritti e attivi 7/30 giorni (add_bar_stats.sql). Null finché la
+    // migrazione non c'è: il resto della dashboard non deve sparire per questo.
+    supabase.rpc('admin_growth_stats'),
   ]);
+  if (growth.error) console.error('[admin] admin_growth_stats non disponibile:', growth.error.message);
 
   return c.json({
     stats: {
@@ -62,6 +66,7 @@ admin.get('/stats', async (c) => {
       bars: bars.count ?? 0,
       banned: banned.count ?? 0,
       suspended: suspended.count ?? 0,
+      growth: growth.error ? null : growth.data,
     },
   });
 });
@@ -385,15 +390,28 @@ admin.get('/audit', async (c) => {
   });
 });
 
+const SETTINGS_FIELDS =
+  'registration_open, ratings_enabled, maintenance_mode, maintenance_reason, maintenance_eta, beta_mode, monetization_enabled, updated_at';
+
 /** GET /admin/settings — global switches (singleton row). */
 admin.get('/settings', async (c) => {
   const { data, error } = await supabase
     .from('app_settings')
-    .select('registration_open, ratings_enabled, maintenance_mode, maintenance_reason, maintenance_eta, beta_mode, updated_at')
+    .select(SETTINGS_FIELDS)
     .eq('id', 1)
     .maybeSingle();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not load settings');
-  return c.json({ settings: data });
+
+  // Spegnere la monetizzazione ferma i pagamenti nuovi, non i rinnovi degli
+  // abbonamenti che esistono già: quelli li incassano Stripe e Google Play per
+  // conto loro. Il pannello li conta, così si sa cosa resta da disdire a mano.
+  const { count: renewing } = await supabase
+    .from('plus_subscriptions')
+    .select('user_id', { count: 'exact', head: true })
+    .in('status', ['active', 'trialing', 'past_due'])
+    .eq('cancel_at_period_end', false);
+
+  return c.json({ settings: data, renewing_subscriptions: renewing ?? null });
 });
 
 /** PUT /admin/settings — flip one or more switches. */
@@ -403,7 +421,7 @@ admin.put('/settings', async (c) => {
     .from('app_settings')
     .update({ ...patch, updated_at: new Date().toISOString(), updated_by: c.get('user').id })
     .eq('id', 1)
-    .select('registration_open, ratings_enabled, maintenance_mode, maintenance_reason, maintenance_eta, beta_mode, updated_at')
+    .select(SETTINGS_FIELDS)
     .single();
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update settings');
   // The gate keeps the switches in memory for a few seconds: forget them, so

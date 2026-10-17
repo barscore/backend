@@ -8,6 +8,7 @@ import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
 import { assertCleanText } from '../lib/textFilter.js';
+import { assertModerated } from '../lib/moderation.js';
 import {
   nearbyEventsQuerySchema,
   createEventSchema,
@@ -158,6 +159,7 @@ events.post(
         lng = bar.lng;
       }
     }
+    await assertModerated([body.title, body.description], { imageUrl: body.photo_url });
 
     const { data, error } = await supabase
       .from('events')
@@ -216,6 +218,7 @@ events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), 
     throw new AppError(403, 'FORBIDDEN', 'Puoi modificare solo i tuoi eventi');
   }
   if (existing.cancelled_at) throw new AppError(409, 'CONFLICT', 'Evento annullato');
+  await assertModerated([body.title, body.description], { imageUrl: body.photo_url });
 
   const { data, error } = await supabase
     .from('events')

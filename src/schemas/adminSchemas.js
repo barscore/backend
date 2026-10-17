@@ -49,6 +49,8 @@ export const settingsSchema = z
     maintenance_eta: z.string().datetime({ offset: true }).nullable().optional(),
     // Beta program: app locked for everyone except admin/moderator/betatester.
     beta_mode: z.boolean().optional(),
+    // OFF = nessun acquisto (rabar+, boost) e nessuna pubblicità, su tutti i client.
+    monetization_enabled: z.boolean().optional(),
   })
   .refine((o) => Object.keys(o).length > 0, { message: 'No settings provided' });
 

@@ -6,6 +6,7 @@ import { AppError } from '../middleware/errorHandler.js';
 import { PLANS, PlusOwnershipError, isPlus, syncGoogleSubscription } from '../lib/plus.js';
 import { googlePlayConfigured, GooglePlayError } from '../lib/googlePlay.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
+import { assertMonetizationEnabled } from '../lib/appSettings.js';
 import { plusCheckoutSchema, plusGoogleVerifySchema } from '../schemas/plusSchemas.js';
 
 // rabar+ — abbonamento (badge "+", tutti i temi, niente pubblicità).
@@ -53,6 +54,7 @@ plus.get('/status', requireAuth, async (c) => {
 /** POST /plus/checkout — apre la Stripe Checkout Session in modalità abbonamento. */
 plus.post('/checkout', requireAuth, async (c) => {
   if (!stripe) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
+  await assertMonetizationEnabled();
   const user = c.get('user');
   const { plan } = plusCheckoutSchema.parse(await c.req.json());
   const p = PLANS[plan];

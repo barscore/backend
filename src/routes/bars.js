@@ -16,6 +16,8 @@ import {
 import { listTopQuerySchema } from '../schemas/drinkSchemas.js';
 import { createClaimSchema } from '../schemas/organizerSchemas.js';
 import { assertOwnedPaths } from '../lib/proofs.js';
+import { assertCleanText } from '../lib/textFilter.js';
+import { assertModerated } from '../lib/moderation.js';
 import { fetchElement, reverseGeocode } from '../lib/osm.js';
 import ratings from './ratings.js';
 
@@ -308,6 +310,7 @@ bars.patch(
       accepts_free_drinks: z.boolean(),
       free_drinks_hours: z.string().nullable().optional()
     }).parse(await c.req.json());
+    assertCleanText(body.free_drinks_hours);
 
     const { data: bar, error: barErr } = await supabase
       .from('bars')
@@ -321,6 +324,7 @@ bars.patch(
     if (bar.owner_id !== user.id && user.role !== 'admin' && user.role !== 'moderator') {
       throw new AppError(403, 'FORBIDDEN', 'Solo il proprietario può modificare queste impostazioni');
     }
+    await assertModerated([body.free_drinks_hours]);
 
     const { error } = await supabase
       .from('bars')

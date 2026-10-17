@@ -30,6 +30,7 @@ import stripeWebhookRoutes from './routes/stripeWebhook.js';
 import googlePlayRoutes from './routes/googlePlay.js';
 import cronRoutes from './routes/cron.js';
 import authRoutes from './routes/auth.js';
+import statsRoutes from './routes/stats.js';
 
 const app = new Hono();
 
@@ -116,6 +117,11 @@ app.use('*', async (c, next) => {
     throw new AppError(503, 'MAINTENANCE', 'Sito in manutenzione — scritture disabilitate');
   }
 
+  // Le statistiche (scansioni, aperture, ping di attività) non sono contenuti:
+  // in beta le mandano anche i visitatori fuori dal test, ed è proprio lì che
+  // servono per contarli.
+  if (c.req.path.startsWith('/stats/')) return next();
+
   if (settings?.beta_mode) {
     // Resolve the caller's role from the Bearer token (best-effort: anonymous
     // or invalid token simply means no role → blocked). lookupCaller leaves
@@ -151,6 +157,7 @@ app.route('/stripe', stripeWebhookRoutes);
 app.route('/google-play', googlePlayRoutes);
 app.route('/cron', cronRoutes);
 app.route('/auth', authRoutes);
+app.route('/stats', statsRoutes);
 
 app.notFound((c) =>
   c.json({ error: 'Not found', code: 'NOT_FOUND', statusCode: 404 }, 404),

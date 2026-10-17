@@ -7,6 +7,7 @@ import { audit } from '../lib/audit.js';
 import { isPlus } from '../lib/plus.js';
 import { notify } from '../lib/notify.js';
 import { assertCleanText } from '../lib/textFilter.js';
+import { assertModerated } from '../lib/moderation.js';
 import {
   createRatingSchema,
   updateRatingSchema,
@@ -75,6 +76,7 @@ ratings.post('/', requireAuth, async (c) => {
   assertCleanText(body.commento);
   await assertRatingsEnabled();
   await assertBarExists(barId);
+  await assertModerated([body.commento]);
 
   const { data, error } = await supabase
     .from('ratings')
@@ -108,6 +110,7 @@ ratings.put('/:rid', requireAuth, async (c) => {
   if (!existing) throw new AppError(404, 'NOT_FOUND', 'Rating not found');
   if (existing.user_id !== user.id)
     throw new AppError(403, 'FORBIDDEN', 'Not your rating');
+  await assertModerated([body.commento]);
 
   const { data, error } = await supabase
     .from('ratings')
@@ -215,6 +218,7 @@ ratings.put('/:rid/reply', requireAuth, async (c) => {
   if (bar.owner_id !== user.id) {
     throw new AppError(403, 'FORBIDDEN', 'Solo il proprietario del bar può rispondere');
   }
+  await assertModerated([risposta]);
 
   const { data, error } = await supabase
     .from('ratings')

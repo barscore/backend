@@ -89,12 +89,18 @@ cron.post('/reminders', async (c) => {
 
   const googleRefreshed = await refreshLapsedGoogle();
 
+  // Statistiche dei bar: eventi e legami dispositivo-account oltre i 13 mesi
+  // dichiarati nell'informativa (add_bar_stats.sql).
+  const { data: statsPruned, error: statsErr } = await supabase.rpc('prune_bar_stats');
+  if (statsErr) console.error('[cron] prune_bar_stats fallita:', statsErr.message);
+
   return c.json({
     ok: true,
     reminded,
     pruned: error ? null : (pruned ?? 0),
     nearby_pruned: nearbyPruned,
     google_refreshed: googleRefreshed,
+    stats_pruned: statsErr ? null : (statsPruned ?? 0),
   });
 });
 

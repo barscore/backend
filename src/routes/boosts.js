@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
+import { assertMonetizationEnabled } from '../lib/appSettings.js';
 import { uuidParam } from '../schemas/common.js';
 import {
   TIERS,
@@ -78,6 +79,7 @@ boosts.post(
   sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'boost-checkout' }),
   async (c) => {
     if (!stripe) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
+    await assertMonetizationEnabled();
     const user = c.get('user');
     const { tier, event_id, bar_id, sponsor_radius_km } = boostCheckoutSchema.parse(
       await c.req.json(),
@@ -151,6 +153,7 @@ boosts.post(
   requireRole('organizer'),
   sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'boost-order' }),
   async (c) => {
+    await assertMonetizationEnabled();
     const user = c.get('user');
     const { tier, event_id, bar_id, sponsor_radius_km } = appleOrderSchema.parse(
       await c.req.json(),
@@ -273,6 +276,7 @@ boosts.post(
   sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'boost-order' }),
   async (c) => {
     if (!googlePlayConfigured()) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
+    await assertMonetizationEnabled();
     const user = c.get('user');
     const { tier, event_id, bar_id } = googleOrderSchema.parse(await c.req.json());
     const t = TIERS[tier];

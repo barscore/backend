@@ -4,7 +4,7 @@
 //   SUPABASE_URL=http://x SUPABASE_SERVICE_ROLE_KEY=x node src/lib/appSettings.check.mjs
 import assert from 'node:assert/strict';
 import { supabase } from './supabase.js';
-import { getWriteSwitches, invalidateWriteSwitches } from './appSettings.js';
+import { assertMonetizationEnabled, getWriteSwitches, invalidateWriteSwitches } from './appSettings.js';
 import { lookupCaller, requireAuth } from '../middleware/auth.js';
 
 const calls = { settings: 0, profiles: 0, getUser: 0 };
@@ -81,5 +81,26 @@ profileRow = { role: 'user', banned: true, suspended_until: null };
 await assert.rejects(requireAuth(ctx('Bearer buono'), async () => {}), { code: 'BANNED' });
 profileRow = { role: 'user', banned: false, suspended_until: new Date(Date.now() + 60_000).toISOString() };
 await assert.rejects(requireAuth(ctx('Bearer buono'), async () => {}), { code: 'SUSPENDED' });
+
+// --- monetizzazione: passa solo con la colonna a TRUE (fail-closed)
+const monetization = async (row, error = null) => {
+  invalidateWriteSwitches();
+  settingsRow = row;
+  settingsError = error;
+  try {
+    await assertMonetizationEnabled();
+    return 'aperta';
+  } catch (e) {
+    assert.equal(e.code, 'MONETIZATION_OFF');
+    assert.equal(e.statusCode, 503);
+    return 'chiusa';
+  } finally {
+    settingsError = null;
+  }
+};
+assert.equal(await monetization({ maintenance_mode: false, beta_mode: false, monetization_enabled: true }), 'aperta');
+assert.equal(await monetization({ maintenance_mode: false, beta_mode: false, monetization_enabled: false }), 'chiusa');
+assert.equal(await monetization({ maintenance_mode: false, beta_mode: false }), 'chiusa', 'colonna non ancora creata');
+assert.equal(await monetization(null, new Error('db giù')), 'chiusa', 'riga illeggibile');
 
 console.log('appSettings ok');
