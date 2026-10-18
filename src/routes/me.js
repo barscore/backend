@@ -13,11 +13,8 @@ import {
   createOrganizerRequestSchema,
   proofUploadSchema,
 } from '../schemas/organizerSchemas.js';
-import {
-  assertOwnedPaths,
-  createProofUploadUrls,
-  deleteAllProofsForUser,
-} from '../lib/proofs.js';
+import { assertOwnedPaths, createProofUploadUrls } from '../lib/proofs.js';
+import { eraseAccount } from '../lib/accountDeletion.js';
 
 // Account-scoped self routes. All require auth; a user only ever reads their own
 // profile and ratings. Credential changes go through supabase-js on the frontend.
@@ -338,18 +335,23 @@ me.get('/events', async (c) => {
  * suoi (li ha caricati lui) e il path interno non è un suo dato, è il modo in
  * cui organizziamo il bucket. Il nome basta a sapere cosa era allegato a cosa.
  *
- * Limite stretto: la rotta apre nove query e serializza l'intera storia
+ * Limite stretto: la rotta apre diciassette query e serializza l'intera storia
  * dell'account, non è una GET qualsiasi.
  */
 me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' }), async (c) => {
   const user = c.get('user');
   const mine = (table, columns) => supabase.from(table).select(columns).eq('user_id', user.id);
+  const createdByMe = (table, columns) => supabase.from(table).select(columns).eq('created_by', user.id);
 
-  const [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims, barEvents] =
+  const [
+    profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims,
+    events, prMemberships, replies, reports, barSuggestions, drinkSuggestions, plusSub, boostOrders,
+    freeDrink,
+  ] =
     await Promise.all([
       supabase
         .from('profiles')
-        .select('id, username, avatar_url, created_at, plus_until, rewarded_count')
+        .select('id, username, avatar_url, instagram_username, whatsapp_number, role, organizer_type, is_explorer, created_at, plus_until, rewarded_count')
         .eq('id', user.id)
         .maybeSingle(),
       mine(
@@ -370,20 +372,39 @@ me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' 
         'bar_claims',
         'id, bar_id, note, status, admin_note, created_at, reviewed_at, proof_files',
       ),
-      // Le interazioni con i bar fatte da loggato (statistiche dei locali).
-      mine('bar_events', 'bar_id, kind, source, created_at')
-        .order('created_at', { ascending: false })
-        .limit(10000),
+      // Quello che l'utente ha pubblicato o inviato oltre alle recensioni.
+      createdByMe(
+        'events',
+        'id, bar_id, title, description, lat, lng, starts_at, ends_at, cancelled_at, has_presales, photo_url, free_drink, created_at',
+      ).order('created_at', { ascending: false }),
+      supabase.from('event_prs').select('event_id, approved_at, created_at').eq('pr_id', user.id),
+      // Le risposte del gestore stanno sulle recensioni degli altri: si trovano
+      // dal bar che possiede, e se ne esporta solo il testo suo.
+      supabase
+        .from('ratings')
+        .select('bar_id, risposta, risposta_at, bars!inner(owner_id)')
+        .eq('bars.owner_id', user.id)
+        .not('risposta', 'is', null),
+      createdByMe('user_reports', 'type, message, status, created_at'),
+      createdByMe('bar_suggestions', 'name, city, note, contact, lat, lng, status, created_at'),
+      createdByMe('drink_suggestions', 'name, note, status, created_at'),
+      // Acquisti: solo ciò che sta nel nostro database. Ricevute e dati di
+      // pagamento li custodiscono Stripe, Google Play e Apple.
+      mine('plus_subscriptions', 'provider, plan, status, current_period_end, cancel_at_period_end, created_at').maybeSingle(),
+      mine('boost_orders', 'event_id, bar_id, tier, amount_cents, status, created_at, paid_at'),
+      mine('free_drink_redemptions', 'bar_id, redeemed_at').maybeSingle(),
     ]);
 
-  // Prima di add_bar_stats.sql la tabella non esiste: non c'è niente da
-  // esportare, e non è un export incompleto.
-  const noTable = (r) => ['42P01', 'PGRST205'].includes(r.error?.code);
-  if (noTable(barEvents)) barEvents.error = null;
+  // Le statistiche dei locali (bar_events) non ci sono: legate al solo
+  // dispositivo, mai all'account, non sono dati di questo utente da esportare.
 
   // Un export incompleto spacciato per completo è peggio di un errore: se anche
   // una sola query fallisce, fallisce tutto.
-  const parts = [profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims, barEvents];
+  const parts = [
+    profile, ratings, drinkVotes, bookmarks, follows, notifications, requests, claims,
+    events, prMemberships, replies, reports, barSuggestions, drinkSuggestions, plusSub, boostOrders,
+    freeDrink,
+  ];
   if (parts.some((r) => r.error) || !profile.data) {
     throw new AppError(500, 'INTERNAL_ERROR', 'Export non riuscito');
   }
@@ -395,9 +416,13 @@ me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' 
   // Senza questo header il browser mostra il JSON invece di salvarlo.
   c.header('Content-Disposition', 'attachment; filename="rabar-dati.json"');
   return c.json({
-    format_version: 1,
+    format_version: 2,
     exported_at: new Date().toISOString(),
-    profile: { ...profile.data, email: user.email },
+    profile: {
+      ...profile.data,
+      email: user.email,
+      terms_accepted_at: c.get('caller')?.user?.user_metadata?.terms_accepted_at ?? null,
+    },
     ratings: ratings.data ?? [],
     drink_votes: drinkVotes.data ?? [],
     bookmarks: bookmarks.data ?? [],
@@ -405,24 +430,23 @@ me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' 
     notifications: notifications.data ?? [],
     organizer_requests: withFileNames(requests.data ?? []),
     claims: withFileNames(claims.data ?? []),
-    bar_interactions: barEvents.data ?? [],
+    events: events.data ?? [],
+    pr_events: prMemberships.data ?? [],
+    owner_replies: (replies.data ?? []).map(({ bars, ...r }) => r),
+    reports: reports.data ?? [],
+    bar_suggestions: barSuggestions.data ?? [],
+    drink_suggestions: drinkSuggestions.data ?? [],
+    plus_subscription: plusSub.data ?? null,
+    boost_orders: boostOrders.data ?? [],
+    free_drink_redemption: freeDrink.data ?? null,
   });
 });
 
 /** DELETE /me — the caller erases their own account (GDPR art. 17). Deleting the
- *  auth user cascades to profiles + ratings + votes (ON DELETE CASCADE). */
+ *  auth user cascades to profiles + ratings + votes (ON DELETE CASCADE); Stripe
+ *  and the proof files are handled by eraseAccount. */
 me.delete('/', async (c) => {
-  const user = c.get('user');
-
-  // Il cascade delle FK non arriva allo storage: senza questa riga i documenti
-  // d'identità e le visure allegati alle verifiche resterebbero nel bucket dopo
-  // una cancellazione chiesta dall'utente, cioè esattamente ciò che l'art. 17
-  // GDPR vieta. Best-effort: se lo storage fa i capricci l'account si cancella
-  // comunque (il fallimento viene loggato).
-  await deleteAllProofsForUser(user.id);
-
-  const { error } = await supabase.auth.admin.deleteUser(user.id);
-  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Eliminazione account fallita');
+  await eraseAccount(c.get('user').id);
   return c.json({ success: true });
 });
 

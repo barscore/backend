@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { audit } from '../lib/audit.js';
+import { eraseAccount } from '../lib/accountDeletion.js';
 import { invalidateWriteSwitches } from '../lib/appSettings.js';
 import { notify } from '../lib/notify.js';
 import {
@@ -277,15 +278,16 @@ admin.put('/users/:id/role', async (c) => {
   return c.json({ user: data });
 });
 
-/** DELETE /admin/users/:id — hard-delete the account (auth + cascade). Emergency. */
+/** DELETE /admin/users/:id — hard-delete the account (auth + cascade). Emergency,
+ *  and the way to honour a deletion request sent by email. */
 admin.delete('/users/:id', async (c) => {
   const id = uuidParam(c);
   assertNotSelf(c, id);
   const before = await assertUserExists(id);
 
-  // Deleting the auth user cascades to profiles + ratings (ON DELETE CASCADE).
-  const { error } = await supabase.auth.admin.deleteUser(id);
-  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Eliminazione account fallita');
+  // Stesso percorso di DELETE /me: abbonamento Stripe, documenti di verifica,
+  // poi l'utente auth (cascade su profilo, recensioni, voti).
+  await eraseAccount(id);
 
   // Il ruolo cancellato è l'unica traccia che resta di chi era: la riga profilo
   // non c'è più e il target_id da solo non dice nulla a chi rilegge il log.

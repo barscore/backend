@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
-import { lookupCaller, requireAuth } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { uuidParam } from '../schemas/common.js';
-import { statsEventsSchema, statsPingSchema, barStatsQuerySchema } from '../schemas/statsSchemas.js';
+import { statsEventsSchema, barStatsQuerySchema } from '../schemas/statsSchemas.js';
 
 // Statistiche dei bar: i client mandano le interazioni (scansioni del QR/NFC
 // del locale, aperture della scheda, pulsanti), il proprietario legge i
@@ -13,6 +13,11 @@ import { statsEventsSchema, statsPingSchema, barStatsQuerySchema } from '../sche
 // La raccolta è best-effort: un evento che non si scrive non deve mai rompere
 // la pagina di chi lo manda, quindi /events risponde 202 anche quando il DB
 // rifiuta, e i client non ritentano.
+//
+// Il dispositivo (UUID casuale del client) non si lega mai a un account: è ciò
+// che tiene queste statistiche tra gli strumenti assimilabili ai cookie tecnici
+// (linee guida del Garante, 10 giugno 2021), senza consenso. Quindi /events non
+// legge il token, e /ping non riceve il dispositivo.
 const stats = new Hono();
 
 let lastWriteErrorLogAt = 0;
@@ -26,19 +31,19 @@ function logWriteError(what, error) {
 /**
  * POST /stats/events — un lotto di interazioni da un dispositivo.
  * Pubblica: le scansioni arrivano soprattutto da chi non ha ancora un account.
- * Se c'è un token valido l'evento porta anche l'account, e il dispositivo
- * resta legato a lui (è così che si conta chi si registra dopo una scansione).
+ * I client mandano il token come in ogni richiesta, ma qui non si apre: conta
+ * solo se c'è («da loggato»), per separare le scansioni anonime nel percorso
+ * scansione → registrazione → recensione.
  */
 stats.post(
   '/events',
   sharedRateLimiter({ windowMs: 60_000, max: 30, key: 'stats-events' }),
   async (c) => {
     const { visitor_id, events } = statsEventsSchema.parse(await c.req.json());
-    const caller = await lookupCaller(c);
 
     const { data, error } = await supabase.rpc('record_bar_events', {
       p_visitor: visitor_id,
-      p_user: caller?.user?.id ?? null,
+      p_signed_in: Boolean(c.req.header('authorization')),
       p_events: events,
     });
     if (error) logWriteError('evento', error);
@@ -48,15 +53,11 @@ stats.post(
 
 /**
  * POST /stats/ping — «sono ancora qui», da chi è loggato, al massimo qualche
- * volta al giorno. Alimenta gli utenti attivi del pannello admin e lega il
- * dispositivo all'account.
+ * volta al giorno. Alimenta gli utenti attivi del pannello admin. Il corpo si
+ * ignora: i client di prima mandavano il dispositivo, che qui non serve.
  */
 stats.post('/ping', requireAuth, async (c) => {
-  const { visitor_id } = statsPingSchema.parse(await c.req.json());
-  const { error } = await supabase.rpc('touch_visitor', {
-    p_visitor: visitor_id,
-    p_user: c.get('user').id,
-  });
+  const { error } = await supabase.rpc('touch_user', { p_user: c.get('user').id });
   if (error) logWriteError('ping', error);
   return c.json({ ok: !error }, 202);
 });
