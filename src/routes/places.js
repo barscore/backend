@@ -3,59 +3,66 @@ import { z } from 'zod';
 import { waitUntil } from '@vercel/functions';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { findNearbyBars, geocode, searchBars, searchPlaces, haversineKm } from '../lib/osm.js';
+import { findBarsInBox, geocode, searchBars, searchPlaces, haversineKm } from '../lib/osm.js';
 import { dbPatterns, relevance } from '../lib/searchText.js';
 import { bboxAround, bboxOf, withinBbox } from '../lib/bbox.js';
-import { readShared, writeShared } from '../lib/nearbyStore.js';
+import { claimFetch, readTiles, releaseFetch, writeTiles } from '../lib/nearbyStore.js';
+import { MAX_TILES, TILE_VERSION, splitByTile, tilesAround, tilesBox } from '../lib/nearbyTiles.js';
 import { supabase } from '../lib/supabase.js';
 import { AppError } from '../middleware/errorHandler.js';
 
 // Free OSM-backed discovery: find bars + geocode addresses. No API key.
 const places = new Hono();
 
-// --- Nearby cache (stale-while-revalidate, disk-persistent) -----------------
-// Overpass is slow (~9-20s) and the only healthy public mirror. So we never let
-// a user wait on it twice: results are cached per rounded coord+radius. Two
-// windows:
-//   * FRESH  (< TTL)      → serve from cache, no upstream hit.
-//   * STALE  (TTL..MAX)   → serve cache instantly AND refresh in background.
-//   * cold/expired        → the one unavoidable slow fetch.
-// The cache is persisted to disk so it survives `--watch` reloads and restarts
-// (the reason it felt "slow as before" — in-memory Map was wiped on every save).
-// Memory and disk belong to ONE instance. Behind them sits a table shared by
-// all of them (lib/nearbyStore.js): a brand-new instance asks it before asking
-// Overpass, so the slow fetch is paid once per area, not once per cold start.
-const NEARBY_TTL_MS = Number(process.env.NEARBY_CACHE_TTL_MS) || 30 * 60 * 1000; // fresh window
-const NEARBY_MAX_AGE_MS = Number(process.env.NEARBY_CACHE_MAX_AGE_MS) || 7 * 24 * 60 * 60 * 1000; // serve-stale window
-const NEARBY_CACHE_MAX = 2000;
-// How long a cold request waits on Overpass before falling back to the bars in
-// our own table. Below the clients' own timeouts (60 s on the apps).
-const COLD_FALLBACK_MS = Number(process.env.NEARBY_COLD_FALLBACK_MS) || 25 * 1000;
-// With nothing in our table to fall back on, how much longer to wait before
-// answering "empty for now, retry" (`stale: true`).
-const COLD_EMPTY_WAIT_MS = Number(process.env.NEARBY_COLD_EMPTY_WAIT_MS) || 20 * 1000;
+// --- Nearby cache: tiles ----------------------------------------------------
+// Overpass is slow — 25-40 s on the public mirrors for a 2 km box, measured on
+// 2026-10-26, and the others timing out — so nobody should wait on it for an
+// area that has been seen before. Places are cached per fixed tile
+// (lib/nearbyTiles.js), shared by every radius and every centre that covers
+// it. The old cache was per rounded centre + exact radius: one more km on the
+// slider, or the map moved one km, and the whole area went back to Overpass.
+// Three layers:
+//   * this instance's memory, persisted to disk so `--watch` reloads and
+//     restarts keep it;
+//   * the `nearby_cache` table, shared by every instance (lib/nearbyStore.js),
+//     which scripts/seed-nearby-tiles.mjs fills in bulk from an OSM extract;
+//   * Overpass, only for tiles nobody has loaded yet.
+// A tile is served however old it is (a month-old bar list beats a spinner);
+// past TILE_FRESH_MS it is reloaded in the background.
+const TILE_FRESH_MS = Number(process.env.NEARBY_TILE_FRESH_MS) || 7 * 24 * 60 * 60 * 1000;
+const TILE_MEMORY_MAX = 4000;
+// How long a request with unloaded tiles waits on Overpass before answering
+// with what it has, flagged `stale`: the clients ask again a moment later, and
+// meanwhile show the tiles already known and the bars in our own table.
+const COLD_WAIT_MS = Number(process.env.NEARBY_COLD_WAIT_MS) || 10 * 1000;
+// A load claimed by another instance: how long the claim holds (longer than
+// findBarsInBox can take with its retry), and how often to look for its result.
+const FETCH_LOCK_MS = 120 * 1000;
+const SHARED_POLL_MS = 1500;
+// Background reload of old tiles: at most this many per request, the ones
+// closest to the centre, so one look at a 25 km radius doesn't send Overpass a
+// 50 km box. The rest follow as people look there.
+const REFRESH_MAX_TILES = 16;
+// A cold load covers at least this radius, whatever was asked (see /nearby).
+const PREFETCH_KM = 8;
 // On Vercel the bundle filesystem is read-only — only /tmp is writable (and it
 // survives between requests on the same warm instance, which is what this cache
 // wants). Locally it stays next to the repo so `--watch` reloads keep it.
 const CACHE_FILE = resolve(
   process.env.NEARBY_CACHE_FILE ||
-    (process.env.VERCEL ? '/tmp/rabar-nearby.json' : './.cache/nearby.json'),
+    (process.env.VERCEL ? '/tmp/rabar-nearby-tiles.json' : './.cache/nearby-tiles.json'),
 );
 
-const nearbyCache = new Map(); // key -> { at, places }
-const inflight = new Map(); // key -> Promise (dedupe concurrent upstream fetches)
-
-// ~1.1km grid at the equator — coarse enough to share cache across nearby
-// clicks, fine enough not to miss bars for the given radius. The `v` prefix is a
-// schema version: bump it whenever the Overpass query changes (e.g. adding
-// nightclubs) so old cached results without the new POIs are ignored.
-const CACHE_VERSION = 'v5'; // v5: cafes added to the Overpass query
-const cacheKey = (lat, lng, r) => `${CACHE_VERSION}:${lat.toFixed(2)},${lng.toFixed(2)},${r}`;
+const tileCache = new Map(); // tile key -> { at, places }
+const inflight = new Map(); // box id -> Promise<Map(tile key -> places) | null>
+const TIMEOUT = Symbol('timeout');
 
 function loadCacheFromDisk() {
   try {
     const raw = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
-    for (const [k, v] of Object.entries(raw)) nearbyCache.set(k, v);
+    for (const [k, v] of Object.entries(raw)) {
+      if (k.startsWith(`${TILE_VERSION}:`)) tileCache.set(k, v);
+    }
   } catch {
     /* no cache file yet — fine */
   }
@@ -70,20 +77,20 @@ function persistToDisk() {
     persistTimer = null;
     try {
       mkdirSync(dirname(CACHE_FILE), { recursive: true });
-      writeFileSync(CACHE_FILE, JSON.stringify(Object.fromEntries(nearbyCache)));
+      writeFileSync(CACHE_FILE, JSON.stringify(Object.fromEntries(tileCache)));
     } catch {
       /* disk cache is best-effort */
     }
   }, 2000);
 }
 
-// `at` is when the places were fetched from Overpass — now, unless the entry
-// comes from the shared table and another instance fetched it earlier.
+// `at` is when the places were fetched from OpenStreetMap — now, unless the
+// entry comes from the shared table and was fetched earlier.
 function cacheSet(key, places, at = Date.now()) {
-  if (nearbyCache.size >= NEARBY_CACHE_MAX && !nearbyCache.has(key)) {
-    nearbyCache.delete(nearbyCache.keys().next().value); // evict oldest
+  if (tileCache.size >= TILE_MEMORY_MAX && !tileCache.has(key)) {
+    tileCache.delete(tileCache.keys().next().value); // evict oldest
   }
-  nearbyCache.set(key, { at, places });
+  tileCache.set(key, { at, places });
   persistToDisk();
 }
 
@@ -97,21 +104,123 @@ function keepAlive(promise) {
   waitUntil(promise.catch(() => {}));
 }
 
-// Dedupe: many clients hitting the same cold key trigger ONE upstream fetch.
-function fetchAndCache(key, lat, lng, radius_km) {
-  if (inflight.has(key)) return inflight.get(key);
-  const p = findNearbyBars(lat, lng, radius_km)
-    .then(async (places) => {
-      cacheSet(key, places);
+/** Resolves with the promise's value, or TIMEOUT if `deadline` comes first. */
+function until(promise, deadline) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((r) => { timer = setTimeout(() => r(TIMEOUT), Math.max(0, deadline - Date.now())); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** The tiles' entries: this instance's first, the shared table for the rest. */
+async function loadTiles(tiles) {
+  const found = new Map();
+  const ask = [];
+  for (const t of tiles) {
+    const hit = tileCache.get(t.key);
+    if (hit) found.set(t.key, hit);
+    else ask.push(t.key);
+  }
+  if (ask.length) {
+    for (const [key, entry] of await readTiles(ask)) {
+      cacheSet(key, entry.places, entry.at);
+      found.set(key, entry);
+    }
+  }
+  return found;
+}
+
+/**
+ * One Overpass query for the box around `tiles`, saved tile by tile. Resolves
+ * with `Map(tile key → places)`, or null when another instance holds the claim
+ * on the same box: its result will show up in the shared table. Requests on
+ * this instance asking for the same box share the one query.
+ */
+function fetchTiles(tiles) {
+  const box = tilesBox(tiles);
+  const id = `${TILE_VERSION}:${box.s},${box.w},${box.n},${box.e}`;
+  let job = inflight.get(id);
+  if (job) return job;
+  job = (async () => {
+    if (!(await claimFetch(id, FETCH_LOCK_MS))) return null;
+    try {
+      const byTile = splitByTile(await findBarsInBox(box), box);
+      const at = Date.now();
+      for (const [key, list] of byTile) cacheSet(key, list, at);
       // Awaited, not fired and forgotten: a serverless instance can be frozen
       // the moment the response is out, and this write is what spares the next
-      // instance the wait. It costs milliseconds on a request that took seconds.
-      await writeShared(key, places);
-      return places;
-    })
-    .finally(() => inflight.delete(key));
-  inflight.set(key, p);
-  return p;
+      // instance the wait.
+      await writeTiles(byTile, at);
+      return byTile;
+    } finally {
+      // Failed or done, the box is free: a failure is often a burst of
+      // refusals from the mirrors, and the clients' next try may get through.
+      await releaseFetch(id).catch(() => {});
+    }
+  })().finally(() => inflight.delete(id));
+  inflight.set(id, job);
+  return job;
+}
+
+/** Another instance is loading these tiles: watch the shared table for them. */
+async function waitForShared(tiles, deadline) {
+  const keys = tiles.map((t) => t.key);
+  while (Date.now() + SHARED_POLL_MS < deadline) {
+    await new Promise((r) => setTimeout(r, SHARED_POLL_MS));
+    const rows = await readTiles(keys);
+    if (keys.every((k) => rows.has(k))) {
+      const out = new Map();
+      for (const [key, entry] of rows) {
+        cacheSet(key, entry.places, entry.at);
+        out.set(key, entry.places);
+      }
+      return out;
+    }
+  }
+  return TIMEOUT;
+}
+
+/**
+ * Tiles nobody has loaded, by `deadline`: `Map(tile key → places)` or TIMEOUT.
+ * On TIMEOUT our own query, if any, keeps going and fills the cache for the
+ * client's next try. Throws when Overpass failed.
+ */
+async function loadMissing(tiles, deadline) {
+  const job = fetchTiles(tiles);
+  let loaded = await until(job, deadline);
+  if (loaded === null) loaded = await waitForShared(tiles, deadline);
+  if (loaded === TIMEOUT) keepAlive(job);
+  return loaded;
+}
+
+/**
+ * Tiles past their fresh window, reloaded behind the response. Another
+ * instance may have done it already: the shared table is asked first.
+ */
+async function refreshTiles(tiles) {
+  const fresh = Date.now() - TILE_FRESH_MS;
+  const shared = await readTiles(tiles.map((t) => t.key));
+  for (const [key, entry] of shared) {
+    if (entry.at > (tileCache.get(key)?.at ?? 0)) cacheSet(key, entry.places, entry.at);
+  }
+  const old = tiles.filter((t) => !(shared.get(t.key)?.at > fresh));
+  if (old.length) await fetchTiles(old);
+}
+
+/** The places of `tiles` inside the circle, one per OSM element. */
+function placesWithin(tiles, entries, lat, lng, radiusKm) {
+  const seen = new Set();
+  const out = [];
+  for (const t of tiles) {
+    for (const p of entries.get(t.key)?.places ?? []) {
+      const id = `${p.osm_type}/${p.osm_node_id}`;
+      if (seen.has(id) || haversineKm(lat, lng, p.lat, p.lng) > radiusKm) continue;
+      seen.add(id);
+      out.push(p);
+    }
+  }
+  return out;
 }
 
 // A persisted bar keeps the coordinates it had when it was saved; the OSM node
@@ -224,7 +333,7 @@ async function nearbySponsored(lat, lng) {
 }
 
 /**
- * Last resort when Overpass is down and nothing is cached for the area: the
+ * Stand-in for the tiles Overpass hasn't loaded yet (or can't): the
  * bars already in our own table, shaped like OSM places. It is only the venues
  * somebody has opened, rated or claimed — not the whole map — but those are the
  * ones with something to show, and a short list beats a 502: on 2026-10-14 every
@@ -325,77 +434,52 @@ places.get('/nearby', async (c) => {
   const { lat, lng, radius_km } = nearbySchema.parse(
     Object.fromEntries(new URL(c.req.url).searchParams),
   );
-  const key = cacheKey(lat, lng, radius_km);
-  let cached = nearbyCache.get(key);
-  let age = cached ? Date.now() - cached.at : Infinity;
+  const tiles = tilesAround(lat, lng, radius_km);
+  if (tiles.length > MAX_TILES) {
+    throw new AppError(400, 'RADIUS_TOO_LARGE', 'Radius too large for this latitude');
+  }
+  const entries = await loadTiles(tiles);
 
-  // Nothing usable in this instance: before paying for Overpass, see whether
-  // another instance already did.
-  if (age >= NEARBY_MAX_AGE_MS) {
-    const shared = await readShared(key);
-    if (shared && Date.now() - shared.at < NEARBY_MAX_AGE_MS) {
-      cacheSet(key, shared.places, shared.at);
-      cached = nearbyCache.get(key);
-      age = Date.now() - cached.at;
+  // Old tiles go out as they are, and are reloaded for the next request.
+  const fresh = Date.now() - TILE_FRESH_MS;
+  const old = tiles.filter((t) => entries.has(t.key) && entries.get(t.key).at < fresh);
+  if (old.length) keepAlive(refreshTiles(old.slice(0, REFRESH_MAX_TILES)));
+
+  // Tiles never loaded — a city abroad, the edge of a wider radius: the one
+  // unavoidable wait on Overpass, bounded by COLD_WAIT_MS.
+  const missing = tiles.filter((t) => !entries.has(t.key));
+  let stale = false;
+  if (missing.length) {
+    // Overpass takes about as long for a few km more, and the slider moved up
+    // or the map moved a little would otherwise be another cold wait.
+    const load = radius_km < PREFETCH_KM
+      ? tilesAround(lat, lng, PREFETCH_KM).filter((t) => !entries.has(t.key))
+      : missing;
+    try {
+      const loaded = await loadMissing(load, Date.now() + COLD_WAIT_MS);
+      if (loaded === TIMEOUT) stale = true;
+      else for (const [key, list] of loaded) entries.set(key, { at: Date.now(), places: list });
+    } catch (e) {
+      // Usually a burst of refusals from the mirrors: answered `stale` like a
+      // slow load, so the clients ask again (and get another try at Overpass)
+      // instead of showing an error at the first one.
+      console.error('[places] Overpass non raggiungibile:', e.message);
+      stale = true;
     }
   }
 
-  // Read at most once per request: the cold path may already have asked.
-  let fromDb = null;
-  try {
-    let results;
-    if (cached && age < NEARBY_MAX_AGE_MS) {
-      // Serve cache instantly. If past the fresh window, refresh in background
-      // (fire-and-forget) so the NEXT load is fresh — this user waits 0s.
-      results = cached.places;
-      if (age > NEARBY_TTL_MS) keepAlive(fetchAndCache(key, lat, lng, radius_km));
-    } else {
-      // Cold or too stale to trust — the one unavoidable slow fetch. With
-      // both attempts it can run past 80 s, longer than any client waits; past
-      // COLD_FALLBACK_MS the area's bars from our own table go out instead,
-      // while Overpass keeps going and fills the cache for the next request.
-      const upstream = fetchAndCache(key, lat, lng, radius_km);
-      let timer;
-      results = await Promise.race([
-        upstream,
-        new Promise((r) => { timer = setTimeout(() => r(null), COLD_FALLBACK_MS); }),
-      ]).finally(() => clearTimeout(timer));
-      if (results === null) {
-        fromDb = await nearbyFromDb(lat, lng, radius_km);
-        if (fromDb.length) {
-          // The partial list goes out now; Overpass has to finish anyway, or
-          // the client's retry finds the area just as cold as before.
-          keepAlive(upstream);
-          return c.json({ places: await nearbyPayload(fromDb, lat, lng), stale: true });
-        }
-        // Nothing of ours here either. A little longer on Overpass, but not past
-        // what the apps wait (60 s): an empty `stale` answer tells the client to
-        // ask again shortly, a timeout only tells it something broke.
-        results = await Promise.race([
-          upstream,
-          new Promise((r) => { timer = setTimeout(() => r(null), COLD_EMPTY_WAIT_MS); }),
-        ]).finally(() => clearTimeout(timer));
-        if (results === null) {
-          keepAlive(upstream);
-          return c.json({ places: [], stale: true });
-        }
-      }
-    }
-    return c.json({ places: await nearbyPayload(results, lat, lng) });
-  } catch (e) {
-    // Upstream dead but we have *some* cache → serve it rather than 502.
-    if (cached) {
-      return c.json({ places: await nearbyPayload(cached.places, lat, lng), stale: true });
-    }
-    // No cache either: what our own table knows about the area. Not cached —
-    // the next request should try Overpass again, not inherit a partial list.
-    console.error('[places] Overpass non raggiungibile, ripiego dal database:', e.message);
-    fromDb ??= await nearbyFromDb(lat, lng, radius_km);
-    if (fromDb.length) {
-      return c.json({ places: await nearbyPayload(fromDb, lat, lng), stale: true });
-    }
-    throw new AppError(502, 'UPSTREAM_ERROR', 'OpenStreetMap query failed');
+  let found = placesWithin(tiles, entries, lat, lng, radius_km);
+  if (stale) {
+    // The part not loaded yet: what our own table knows about the area. Only
+    // the venues somebody has opened, rated or claimed — not the whole map —
+    // but those are the ones with something to show, and a short list beats a
+    // spinner. Not cached: the next request should get the real tiles.
+    const have = new Set(found.map((p) => String(p.osm_node_id)));
+    const fromDb = await nearbyFromDb(lat, lng, radius_km);
+    found = found.concat(fromDb.filter((b) => !have.has(String(b.osm_node_id))));
+    return c.json({ places: await nearbyPayload(found, lat, lng), stale: true });
   }
+  return c.json({ places: await nearbyPayload(found, lat, lng) });
 });
 
 /**

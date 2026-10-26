@@ -78,7 +78,9 @@ function formatAddress(tags = {}) {
   return [street, tags['addr:postcode'], tags['addr:city']].filter(Boolean).join(', ');
 }
 
-function mapElement(el) {
+// Exported for scripts/seed-nearby-tiles.mjs: a seeded tile and one loaded
+// here must hold places of exactly the same shape.
+export function mapElement(el) {
   const tags = el.tags || {};
   const lat = el.lat ?? el.center?.lat;
   const lng = el.lon ?? el.center?.lon;
@@ -108,17 +110,9 @@ function mapElement(el) {
   };
 }
 
-/**
- * Find bars/pubs/biergartens/nightclubs/cafes within `radiusKm` of (lat, lng)
- * via Overpass. Cafes are included because the Italian "bar" is usually tagged
- * `amenity=cafe` in OSM (`amenity=bar` means cocktail bar there); the client's
- * open-until-23 filter keeps daytime-only coffee shops off the map. Nightclubs
- * (discoteche) come back tagged `amenity=nightclub` so the client can
- * distinguish them from bars. Returns normalized POIs (not persisted).
- */
-// Great-circle distance in km (Haversine). Used to trim the bbox square below
-// back to the requested circular radius; also reused by routes/places.js for
-// result sorting/subtitles.
+// Great-circle distance in km (Haversine). Used to trim a bbox square back to
+// the requested circular radius; also reused by routes/places.js for result
+// sorting/subtitles.
 export function haversineKm(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -131,34 +125,44 @@ export function haversineKm(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-export async function findNearbyBars(lat, lng, radiusKm = 2) {
-  // Scale the Overpass server-side timeout AND our client abort with the radius.
+// The `amenity` values that make a venue. Cafes are included because the
+// Italian "bar" is usually tagged `amenity=cafe` in OSM (`amenity=bar` means
+// cocktail bar there); the client's open-until-23 filter keeps daytime-only
+// coffee shops off the map. Nightclubs (discoteche) come back tagged
+// `amenity=nightclub` so the client can distinguish them from bars. Shared
+// with scripts/seed-nearby-tiles.mjs, which must pick exactly the same venues.
+export const NEARBY_AMENITIES = ['bar', 'pub', 'biergarten', 'nightclub', 'cafe'];
+
+/**
+ * Every venue inside a box (`s`, `w`, `n`, `e` in degrees) via Overpass, as
+ * normalized POIs (not persisted). The box is what routes/places.js asks for:
+ * the tiles it has no data for.
+ */
+export async function findBarsInBox({ s, w, n, e }) {
+  const midLat = ((s + n) / 2) * (Math.PI / 180);
+  const halfSpanKm = (Math.max(n - s, (e - w) * Math.cos(midLat)) * 111) / 2;
+  // Scale the Overpass server-side timeout AND our client abort with the area.
   // A 100km query scans vastly more data than a 2km one; with a fixed 15s/20s
-  // budget every large radius 504s or aborts ("fa fatica"). Grows ~1s per km,
+  // budget every large area 504s or aborts ("fa fatica"). Grows ~1s per km,
   // capped at 120s so a pathological area can't hang a request forever.
-  const serverTimeout = Math.min(120, Math.max(25, Math.round(radiusKm) + 20));
+  const serverTimeout = Math.min(120, Math.max(25, Math.round(halfSpanKm) + 20));
   // Bounding-box query instead of `(around:...)`: an `around` filter makes
   // Overpass compute a great-circle distance for EVERY candidate node, which
-  // 504s/429s on large radii. A bbox is a cheap spatial-index range scan; we
-  // trim the square back to the requested circle in JS (haversine) below.
-  const dLat = radiusKm / 111; // ~111 km per degree latitude
-  const dLng = radiusKm / (111 * Math.cos((lat * Math.PI) / 180) || 1);
-  const bbox = `${lat - dLat},${lng - dLng},${lat + dLat},${lng + dLng}`; // S,W,N,E
+  // 504s/429s on large areas. A bbox is a cheap spatial-index range scan.
+  const bbox = `${s},${w},${n},${e}`;
+  const filter = `["amenity"~"^(${NEARBY_AMENITIES.join('|')})$"](${bbox})`;
   // Above ~30km, drop `way` matches: resolving each way's centroid (`out center`)
-  // is what makes big-radius queries 504 on public mirrors. Bars mapped as
-  // building polygons are rare vs. nodes, so a wide-area search stays reliable at
-  // the cost of a few polygon-only venues.
-  const wayClause =
-    radiusKm > 30
-      ? ''
-      : `way["amenity"~"^(bar|pub|biergarten|nightclub|cafe)$"](${bbox});`;
+  // is what makes big queries 504 on public mirrors. Bars mapped as building
+  // polygons are rare vs. nodes, so a wide-area search stays reliable at the
+  // cost of a few polygon-only venues.
+  const wayClause = halfSpanKm > 30 ? '' : `way${filter};`;
   const query = `
     [out:json][timeout:${serverTimeout}];
     (
-      node["amenity"~"^(bar|pub|biergarten|nightclub|cafe)$"](${bbox});
+      node${filter};
       ${wayClause}
     );
-    out center tags;`;
+    out tags center qt;`;
 
   // Give the client abort a margin over the server-side timeout so the mirror
   // gets to return its own (partial) result instead of us cutting it off.
@@ -171,10 +175,13 @@ export async function findNearbyBars(lat, lng, radiusKm = 2) {
     await new Promise((r) => setTimeout(r, 1500));
     data = await overpassFetch(query, (serverTimeout + 15) * 1000);
   }
-  return (data.elements || [])
-    .map(mapElement)
-    .filter(Boolean)
-    .filter((p) => haversineKm(lat, lng, p.lat, p.lng) <= radiusKm);
+  // A query that ran out of time or memory on the mirror still comes back 200,
+  // with whatever it had found so far and the reason in `remark`. Saved as a
+  // tile, that partial list would replace a complete one: it is a failure.
+  if (/runtime error|timed out|out of memory/i.test(data.remark || '')) {
+    throw new Error(`Overpass incomplete: ${data.remark}`);
+  }
+  return (data.elements || []).map(mapElement).filter(Boolean);
 }
 
 /**

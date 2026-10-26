@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { tick } from '../lib/reminderWorker.js';
 import { supabase } from '../lib/supabase.js';
 import { pruneShared } from '../lib/nearbyStore.js';
+import { TILE_VERSION } from '../lib/nearbyTiles.js';
 import { sameSecret } from '../lib/secret.js';
 import { googlePlayConfigured } from '../lib/googlePlay.js';
 import { syncGoogleSubscription } from '../lib/plus.js';
@@ -82,10 +83,10 @@ cron.post('/reminders', async (c) => {
   const { data: pruned, error } = await supabase.rpc('prune_rate_limits');
   if (error) console.error('[cron] prune_rate_limits fallita:', error.message);
 
-  // Stesso discorso per la cache condivisa dei luoghi: oltre la finestra in cui
-  // viene ancora servita (7 giorni, come in routes/places.js) una voce è solo
-  // spazio occupato.
-  const nearbyPruned = await pruneShared(NEARBY_SHARED_MAX_AGE_MS);
+  // Stesso discorso per la cache condivisa dei luoghi: i tasselli restano (si
+  // aggiornano da soli, vedi routes/places.js), le chiavi di versioni vecchie e
+  // i segni di query rimasti appesi oltre la settimana sono solo spazio occupato.
+  const nearbyPruned = await pruneShared(NEARBY_SHARED_MAX_AGE_MS, `${TILE_VERSION}:`);
 
   const googleRefreshed = await refreshLapsedGoogle();
 

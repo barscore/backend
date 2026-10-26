@@ -84,13 +84,17 @@ events.get('/', async (c) => {
   return c.json({ events: flattened });
 });
 
-/** GET /events/:id — fetch a single event by ID. */
+/**
+ * GET /events/:id — fetch a single event by ID. Cancelled events still answer
+ * (a notification or a shared link can point at one): `cancelled_at` tells the
+ * page to say so instead of selling presales for it.
+ */
 events.get('/:id', async (c) => {
   const id = uuidParam(c);
   const { data, error } = await supabase
     .from('events')
     .select(
-      'id, bar_id, title, description, lat, lng, starts_at, ends_at, boost_until, created_by, has_presales, photo_url, free_drink, bars(name), profiles!events_created_by_fkey(username, role)',
+      'id, bar_id, title, description, lat, lng, starts_at, ends_at, cancelled_at, boost_until, created_by, has_presales, photo_url, free_drink, bars(name), profiles!events_created_by_fkey(username, role)',
     )
     .eq('id', id)
     .maybeSingle();
