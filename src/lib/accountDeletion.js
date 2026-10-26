@@ -2,6 +2,7 @@ import Stripe from 'stripe';
 import { supabase } from './supabase.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { deleteAllProofsForUser } from './proofs.js';
+import { deleteAllMediaForUser } from './media.js';
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
@@ -15,12 +16,14 @@ const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SEC
  *    più nulla a cui il diritto possa andare. Se la disdetta non riesce l'account
  *    resta dov'è e si può riprovare: meglio un errore che un addebito senza
  *    servizio. Google Play e App Store non si annullano da qui: le app avvisano.
- *  - i documenti allegati alle verifiche (visure, documenti d'identità) stanno
- *    nello storage, che l'art. 17 GDPR copre come il resto.
+ *  - i documenti allegati alle verifiche (visure, documenti d'identità), la foto
+ *    profilo e le copertine degli eventi stanno nello storage, che l'art. 17
+ *    GDPR copre come il resto.
  */
 export async function eraseAccount(userId) {
   await cancelStripeSubscription(userId);
   await deleteAllProofsForUser(userId);
+  await deleteAllMediaForUser(userId);
 
   const { error } = await supabase.auth.admin.deleteUser(userId);
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Eliminazione account fallita');

@@ -9,6 +9,7 @@ import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
 import { assertCleanText } from '../lib/textFilter.js';
 import { assertModerated } from '../lib/moderation.js';
+import { assertMediaUploaded, assertOwnedMedia, deleteMedia, mediaPathFromUrl } from '../lib/media.js';
 import {
   nearbyEventsQuerySchema,
   createEventSchema,
@@ -16,6 +17,18 @@ import {
 } from '../schemas/eventSchemas.js';
 
 const events = new Hono();
+
+/**
+ * Una copertina caricata da noi (bucket `media`) deve stare nella cartella di
+ * chi la usa ed esistere davvero. Gli URL esterni — le copertine incollate a
+ * mano prima dell'upload — restano ammessi.
+ */
+async function assertCover(userId, photoUrl) {
+  const path = mediaPathFromUrl(photoUrl);
+  if (!path) return;
+  assertOwnedMedia(userId, 'event_cover', path);
+  await assertMediaUploaded(path);
+}
 
 /**
  * GET /events — upcoming events in a zone, soonest first.
@@ -159,6 +172,7 @@ events.post(
         lng = bar.lng;
       }
     }
+    await assertCover(user.id, body.photo_url);
     await assertModerated([body.title, body.description], { imageUrl: body.photo_url });
 
     const { data, error } = await supabase
@@ -210,7 +224,7 @@ events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), 
 
   const { data: existing } = await supabase
     .from('events')
-    .select('id, created_by, cancelled_at')
+    .select('id, created_by, cancelled_at, photo_url')
     .eq('id', id)
     .maybeSingle();
   if (!existing) throw new AppError(404, 'NOT_FOUND', 'Event not found');
@@ -218,6 +232,9 @@ events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), 
     throw new AppError(403, 'FORBIDDEN', 'Puoi modificare solo i tuoi eventi');
   }
   if (existing.cancelled_at) throw new AppError(409, 'CONFLICT', 'Evento annullato');
+  if (body.photo_url !== undefined && body.photo_url !== existing.photo_url) {
+    await assertCover(user.id, body.photo_url);
+  }
   await assertModerated([body.title, body.description], { imageUrl: body.photo_url });
 
   const { data, error } = await supabase
@@ -229,6 +246,10 @@ events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), 
 
   if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update event');
   if (!data) throw new AppError(404, 'NOT_FOUND', 'Event not found');
+  // Copertina sostituita o tolta: quella vecchia, se era nostra, non serve più.
+  if (body.photo_url !== undefined && existing.photo_url && existing.photo_url !== data.photo_url) {
+    await deleteMedia([mediaPathFromUrl(existing.photo_url)]);
+  }
 
   const { data: fans } = await supabase.from('follows').select('user_id').eq('event_id', id);
   await notify(

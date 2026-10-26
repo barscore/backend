@@ -12,3 +12,14 @@ export const updateProfileSchema = z.object({
     z.string().regex(/^\+?[1-9]\d{7,14}$/, 'Numero WhatsApp non valido (con prefisso, es. +393331234567)').nullable().optional(),
   ),
 });
+
+// Immagini pubbliche (lib/media.js): il client chiede uno slot, carica, poi
+// conferma il path. HEIC no: i client convertono in JPEG prima.
+export const mediaUploadSchema = z.object({
+  kind: z.enum(['avatar', 'event_cover']),
+  ext: z.enum(['jpg', 'jpeg', 'png', 'webp']),
+});
+
+export const setAvatarSchema = z.object({
+  path: z.string().min(10).max(300),
+});

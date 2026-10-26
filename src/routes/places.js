@@ -1,8 +1,10 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { waitUntil } from '@vercel/functions';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { findNearbyBars, geocode, searchBars, haversineKm } from '../lib/osm.js';
+import { findNearbyBars, geocode, searchBars, searchPlaces, haversineKm } from '../lib/osm.js';
+import { dbPatterns, relevance } from '../lib/searchText.js';
 import { bboxAround, bboxOf, withinBbox } from '../lib/bbox.js';
 import { readShared, writeShared } from '../lib/nearbyStore.js';
 import { supabase } from '../lib/supabase.js';
@@ -29,6 +31,9 @@ const NEARBY_CACHE_MAX = 2000;
 // How long a cold request waits on Overpass before falling back to the bars in
 // our own table. Below the clients' own timeouts (60 s on the apps).
 const COLD_FALLBACK_MS = Number(process.env.NEARBY_COLD_FALLBACK_MS) || 25 * 1000;
+// With nothing in our table to fall back on, how much longer to wait before
+// answering "empty for now, retry" (`stale: true`).
+const COLD_EMPTY_WAIT_MS = Number(process.env.NEARBY_COLD_EMPTY_WAIT_MS) || 20 * 1000;
 // On Vercel the bundle filesystem is read-only — only /tmp is writable (and it
 // survives between requests on the same warm instance, which is what this cache
 // wants). Locally it stays next to the repo so `--watch` reloads keep it.
@@ -80,6 +85,16 @@ function cacheSet(key, places, at = Date.now()) {
   }
   nearbyCache.set(key, { at, places });
   persistToDisk();
+}
+
+// A fetch that must outlive the response. On Vercel the instance is frozen the
+// moment the response is out, and a fire-and-forget Overpass call froze with it:
+// the cache was never filled, so every retry of a cold area fell back to the
+// handful of bars in our own table again — a new city, or a wider radius,
+// never showed more than those. `waitUntil` keeps the instance up until it
+// settles; outside Vercel it is a no-op and the promise just runs.
+function keepAlive(promise) {
+  waitUntil(promise.catch(() => {}));
 }
 
 // Dedupe: many clients hitting the same cold key trigger ONE upstream fetch.
@@ -292,6 +307,9 @@ const nearbySchema = z.object({
 const searchSchema = z.object({
   q: z.string().min(2).max(200),
   limit: z.coerce.number().int().min(1).max(20).optional().default(5),
+  // Optional origin: ranks nearer places first, results stay worldwide.
+  lat: z.coerce.number().min(-90).max(90).optional(),
+  lng: z.coerce.number().min(-180).max(180).optional(),
 });
 
 const barSearchSchema = z.object({
@@ -330,7 +348,7 @@ places.get('/nearby', async (c) => {
       // Serve cache instantly. If past the fresh window, refresh in background
       // (fire-and-forget) so the NEXT load is fresh — this user waits 0s.
       results = cached.places;
-      if (age > NEARBY_TTL_MS) fetchAndCache(key, lat, lng, radius_km).catch(() => {});
+      if (age > NEARBY_TTL_MS) keepAlive(fetchAndCache(key, lat, lng, radius_km));
     } else {
       // Cold or too stale to trust — the one unavoidable slow fetch. With
       // both attempts it can run past 80 s, longer than any client waits; past
@@ -345,10 +363,22 @@ places.get('/nearby', async (c) => {
       if (results === null) {
         fromDb = await nearbyFromDb(lat, lng, radius_km);
         if (fromDb.length) {
-          upstream.catch(() => {});
+          // The partial list goes out now; Overpass has to finish anyway, or
+          // the client's retry finds the area just as cold as before.
+          keepAlive(upstream);
           return c.json({ places: await nearbyPayload(fromDb, lat, lng), stale: true });
         }
-        results = await upstream;
+        // Nothing of ours here either. A little longer on Overpass, but not past
+        // what the apps wait (60 s): an empty `stale` answer tells the client to
+        // ask again shortly, a timeout only tells it something broke.
+        results = await Promise.race([
+          upstream,
+          new Promise((r) => { timer = setTimeout(() => r(null), COLD_EMPTY_WAIT_MS); }),
+        ]).finally(() => clearTimeout(timer));
+        if (results === null) {
+          keepAlive(upstream);
+          return c.json({ places: [], stale: true });
+        }
       }
     }
     return c.json({ places: await nearbyPayload(results, lat, lng) });
@@ -369,32 +399,101 @@ places.get('/nearby', async (c) => {
 });
 
 /**
- * GET /places/bars — global free-text bar search (whole planet). Unlike
- * /nearby, ignores distance so a user anywhere can find a bar by name.
- * Enriched with community ratings; distance_km set only when lat/lng given.
+ * Bars in our own table whose name contains one of the query words. Photon
+ * alone missed venues the community knows by a name OSM spells differently,
+ * and ranked a rated bar below an unrated namesake on the other side of town.
+ */
+async function searchDbBars(q) {
+  const patterns = dbPatterns(q);
+  if (!patterns.length) return [];
+  const { data, error } = await supabase
+    .from('bars')
+    .select('osm_node_id, name, address, city, lat, lng, phone, website, cover_image_url')
+    .eq('is_active', true)
+    // Clients key a search hit by its OSM node, like everything on the map.
+    .not('osm_node_id', 'is', null)
+    .or(patterns.map((p) => `name.ilike.%${p}%`).join(','))
+    .limit(60);
+  if (error) {
+    console.error('[places] ricerca nel database fallita:', error.message);
+    return [];
+  }
+  return (data ?? []).map((b) => ({ ...b, osm_type: 'node', amenity: null }));
+}
+
+/**
+ * GET /places/bars — global free-text bar search (whole planet), as natural as
+ * we can make it: Photon and our own table together, ranked by how well the
+ * name matches what was typed (accents, word order, prefixes and typos don't
+ * matter — see lib/searchText.js), then by ratings and distance.
+ * distance_km set only when lat/lng given.
  */
 places.get('/bars', async (c) => {
   const { q, limit, lat, lng } = barSearchSchema.parse(
     Object.fromEntries(new URL(c.req.url).searchParams),
   );
-  try {
-    const bias = lat != null && lng != null ? [lat, lng] : null;
-    const results = await searchBars(q, limit, bias);
-    const enriched = await enrichWithRatings(results, lat ?? null, lng ?? null);
-    return c.json({ places: enriched });
-  } catch (e) {
+  const bias = lat != null && lng != null ? [lat, lng] : null;
+  const [fromOsm, fromDb] = await Promise.all([
+    searchBars(q, 25, bias).catch((e) => {
+      console.error('[places] Photon non raggiungibile:', e.message);
+      return null;
+    }),
+    searchDbBars(q),
+  ]);
+  if (fromOsm === null && !fromDb.length) {
     throw new AppError(502, 'UPSTREAM_ERROR', 'Bar search failed');
   }
+
+  // One entry per OSM node; Photon's copy wins (it has the amenity), ours
+  // fills what it lacks.
+  const byNode = new Map();
+  (fromOsm ?? []).forEach((p, rank) => byNode.set(String(p.osm_node_id), { ...p, rank }));
+  for (const b of fromDb) {
+    const key = String(b.osm_node_id);
+    const prev = byNode.get(key);
+    byNode.set(key, prev ? { ...b, ...Object.fromEntries(Object.entries(prev).filter(([, v]) => v != null)) } : b);
+  }
+
+  const enriched = await enrichWithRatings([...byNode.values()], lat ?? null, lng ?? null);
+  const total = fromOsm?.length || 1;
+  const scored = enriched
+    .map((p) => {
+      let score = relevance(q, p.name, [p.address, p.city].filter(Boolean).join(' '));
+      // Photon matched it on something we can't see (an alternative name): a
+      // floor for its top hits, never above a real name match.
+      if (score === 0 && p.rank != null && p.rank < 5) score = 0.05;
+      if (score === 0) return null;
+      if (p.rank != null) score += 0.1 * (1 - p.rank / total);
+      if (p.total_ratings > 0) score += 0.15;
+      if (p.sponsored) score += 0.05;
+      if (p.distance_km != null) score += 0.3 * Math.exp(-p.distance_km / 15);
+      return { ...p, rank: undefined, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ score, ...p }) => p);
+  return c.json({ places: scored });
 });
 
-/** GET /places/search — geocode a free-text place/address via Nominatim. */
+/**
+ * GET /places/search — places and addresses as you type: cities to look for
+ * bars in, streets and house numbers to put an event at. Photon first (partial
+ * words, typos, no rate limit); Nominatim if Photon is down.
+ */
 places.get('/search', async (c) => {
-  const { q, limit } = searchSchema.parse(
+  const { q, limit, lat, lng } = searchSchema.parse(
     Object.fromEntries(new URL(c.req.url).searchParams),
   );
+  const bias = lat != null && lng != null ? [lat, lng] : null;
+  try {
+    return c.json({ results: await searchPlaces(q, limit, bias) });
+  } catch (e) {
+    console.error('[places] Photon non raggiungibile, provo Nominatim:', e.message);
+  }
   try {
     const results = await geocode(q, limit);
-    return c.json({ results });
+    return c.json({ results: results.map((r) => ({ ...r, name: r.display_name, subtitle: null, kind: 'place' })) });
   } catch (e) {
     throw new AppError(502, 'UPSTREAM_ERROR', 'Geocoding failed');
   }

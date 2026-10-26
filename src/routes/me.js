@@ -15,6 +15,15 @@ import {
 } from '../schemas/organizerSchemas.js';
 import { assertOwnedPaths, createProofUploadUrls } from '../lib/proofs.js';
 import { eraseAccount } from '../lib/accountDeletion.js';
+import { mediaUploadSchema, setAvatarSchema } from '../schemas/userSchemas.js';
+import {
+  assertMediaUploaded,
+  assertOwnedMedia,
+  createMediaUpload,
+  deleteMedia,
+  deleteOtherMedia,
+  publicMediaUrl,
+} from '../lib/media.js';
 
 // Account-scoped self routes. All require auth; a user only ever reads their own
 // profile and ratings. Credential changes go through supabase-js on the frontend.
@@ -156,6 +165,58 @@ me.post('/uploads/proof', sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'p
     files.map((f) => f.ext),
   );
   return c.json({ uploads });
+});
+
+/**
+ * POST /me/uploads/image — upload URL firmato per una foto profilo o la
+ * copertina di un evento. Il path lo sceglie il backend, nella cartella di chi
+ * chiede; `public_url` è l'indirizzo che l'immagine avrà una volta confermata.
+ */
+me.post('/uploads/image', sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'media-upload' }), async (c) => {
+  const user = c.get('user');
+  const { kind, ext } = mediaUploadSchema.parse(await c.req.json());
+  return c.json({ upload: await createMediaUpload(user.id, kind, ext) });
+});
+
+/**
+ * PUT /me/avatar — conferma la foto profilo appena caricata. Passa dalla
+ * moderazione come lo username (policy `identity`: compare accanto a ogni
+ * contenuto dell'utente), poi le foto precedenti vengono cancellate.
+ */
+me.put('/avatar', sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'avatar' }), async (c) => {
+  const user = c.get('user');
+  const { path } = setAvatarSchema.parse(await c.req.json());
+  assertOwnedMedia(user.id, 'avatar', path);
+  await assertMediaUploaded(path);
+
+  const url = publicMediaUrl(path);
+  try {
+    await assertModerated([], { imageUrl: url, policy: 'identity' });
+  } catch (e) {
+    // Rifiutata: il file non deve restare pubblico nemmeno senza riga che lo
+    // usi. Solo lui: la foto di prima resta quella in uso.
+    await deleteMedia([path]);
+    throw e;
+  }
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .update({ avatar_url: url })
+    .eq('id', user.id)
+    .select('id, username, avatar_url')
+    .single();
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update profile');
+  await deleteOtherMedia(user.id, 'avatar', path);
+  return c.json({ profile: data });
+});
+
+/** DELETE /me/avatar — torna all'icona di default. */
+me.delete('/avatar', async (c) => {
+  const user = c.get('user');
+  const { error } = await supabase.from('profiles').update({ avatar_url: null }).eq('id', user.id);
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update profile');
+  await deleteOtherMedia(user.id, 'avatar', null);
+  return c.json({ success: true });
 });
 
 me.post('/promo', async (c) => {

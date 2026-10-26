@@ -261,6 +261,59 @@ export async function searchBars(query, limit = 20, bias = null) {
     });
 }
 
+// Photon `type` values that name an area you could look for bars in.
+const AREA_TYPES = new Set(['city', 'district', 'locality', 'county', 'state', 'country']);
+const ADDRESS_TYPES = new Set(['street', 'house']);
+// POIs come from searchBars; here they would only crowd out the places.
+const POI_KEYS = new Set(['amenity', 'shop', 'tourism', 'leisure', 'office', 'craft']);
+
+/**
+ * Places and addresses as you type, via Photon: cities, districts, streets,
+ * house numbers. Unlike Nominatim it tolerates partial words and typos and has
+ * no 1-request-per-second limit, which a live search box needs.
+ *
+ * `kind` tells the clients what to do with a hit: an `area` recentres the
+ * search there, an `address` places an event. `type` keeps the OSM value
+ * (city, town, village…) the older clients filter on.
+ */
+export async function searchPlaces(query, limit = 6, bias = null) {
+  let url = `${PHOTON_URL}/api/?limit=${Math.min(limit * 2, 20)}&q=${encodeURIComponent(query)}`;
+  if (bias && bias[0] != null && bias[1] != null) url += `&lat=${bias[0]}&lon=${bias[1]}`;
+  const res = await fetch(url, { headers: { 'User-Agent': UA } });
+  if (!res.ok) throw new Error(`Photon error ${res.status}`);
+  const data = await res.json();
+  const seen = new Set();
+  const out = [];
+  for (const f of data.features || []) {
+    const p = f.properties || {};
+    const c = f.geometry?.coordinates;
+    if (!Array.isArray(c) || POI_KEYS.has(p.osm_key)) continue;
+    const kind = AREA_TYPES.has(p.type) ? 'area' : ADDRESS_TYPES.has(p.type) ? 'address' : 'place';
+    const street = [p.street, p.housenumber].filter(Boolean).join(' ');
+    const name = p.type === 'house' ? street || p.name : p.name || street;
+    if (!name) continue;
+    const locality = p.city || p.town || p.village || p.district;
+    const subtitle = [...new Set([locality, p.county, p.state, p.country])]
+      .filter((v) => v && v !== name)
+      .slice(0, 2)
+      .join(', ');
+    const display = subtitle ? `${name}, ${subtitle}` : name;
+    if (seen.has(display)) continue;
+    seen.add(display);
+    out.push({
+      display_name: display,
+      name,
+      subtitle: subtitle || null,
+      lat: Number(c[1]),
+      lng: Number(c[0]),
+      type: p.osm_value || p.type || null,
+      kind,
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 /**
  * Reverse geocode a lat/lng via Nominatim.
  */
