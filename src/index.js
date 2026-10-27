@@ -37,10 +37,19 @@ const app = new Hono();
 // FRONTEND_URL may be a comma-separated allowlist (localhost + LAN IP + prod
 // domain). Use "*" to allow any origin. Needed so iOS Safari / the PWA — served
 // from a different origin than the dev box — aren't blocked by CORS.
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+const parseOrigins = (value) =>
+  value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+const allowedOrigins = parseOrigins(process.env.FRONTEND_URL || 'http://localhost:5173');
+
+// ADMIN_URL: le origini del pannello staff (repo `admin/`, separato dal sito).
+// Sono le sole da cui un browser può chiamare /admin/*: il sito non ci arriva
+// più nemmeno col token di un admin (un XSS lì non tocca l'amministrazione).
+// Il ruolo resta controllato da requireRole a ogni chiamata.
+const adminOrigins = parseOrigins(process.env.ADMIN_URL || 'http://localhost:5174');
+const isAdminPath = (path) => path === '/admin' || path.startsWith('/admin/');
 
 app.use('*', logger());
 // Un'API JSON non serve mai HTML né script: la CSP più stretta possibile, così
@@ -60,15 +69,28 @@ app.use(
 app.use(
   '*',
   cors({
-    origin: (origin) => {
+    origin: (origin, c) => {
+      if (isAdminPath(c.req.path)) return adminOrigins.includes(origin) ? origin : null;
       if (allowedOrigins.includes('*')) return origin || '*';
       if (!origin) return allowedOrigins[0]; // non-browser / same-origin
-      return allowedOrigins.includes(origin) ? origin : null;
+      // Il pannello usa anche rotte fuori da /admin (code di moderazione, login).
+      return allowedOrigins.includes(origin) || adminOrigins.includes(origin) ? origin : null;
     },
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization'],
   }),
 );
+
+// CORS non ferma una richiesta "semplice" né un client fuori dal browser: qui
+// /admin/* rifiuta ogni Origin che non sia il pannello. Senza Origin (app
+// native, script) passa e decide requireRole come prima.
+app.use('*', (c, next) => {
+  const origin = c.req.header('origin');
+  if (origin && isAdminPath(c.req.path) && !adminOrigins.includes(origin)) {
+    throw new AppError(403, 'ADMIN_ORIGIN', 'Pannello staff raggiungibile solo dalla sua origine');
+  }
+  return next();
+});
 
 // Global fixed-window rate limit per IP (generous — protects the free Overpass/
 // Nominatim proxies and the DB from bursts/abuse). Per-route stricter limits
