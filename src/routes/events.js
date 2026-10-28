@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
+import { readEntryPass } from '../lib/entryPass.js';
 import { assertCleanText } from '../lib/textFilter.js';
 import { assertModerated } from '../lib/moderation.js';
 import { assertMediaUploaded, assertOwnedMedia, deleteMedia, mediaPathFromUrl } from '../lib/media.js';
@@ -435,26 +436,53 @@ events.delete('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'
 });
 
 
-/** POST /events/verify-entry — organizers checking user QR code for party entry */
-events.post('/verify-entry', requireAuth, requireRole('organizer', 'admin', 'moderator'), async (c) => {
-  const { user_id } = z.object({ user_id: z.string().uuid() }).parse(await c.req.json());
+/**
+ * POST /events/verify-entry — l'organizzatore controlla il pass alla porta.
+ *
+ * Il QR porta un pass firmato a scadenza (lib/entryPass.js), non più l'id
+ * dell'utente: senza firma valida non si entra. Un QR vecchio (`user_id`) dice
+ * di aggiornare l'app invece di essere accettato. L'avatar torna insieme al
+ * nome perché l'organizzatore guardi in faccia chi ha davanti.
+ */
+events.post(
+  '/verify-entry',
+  requireAuth,
+  requireRole('organizer', 'admin', 'moderator'),
+  sharedRateLimiter({ windowMs: 60_000, max: 60, key: 'verify-entry' }),
+  async (c) => {
+    const body = z
+      .object({ pass: z.string().max(200).optional(), user_id: z.string().optional() })
+      .parse(await c.req.json());
+    if (!body.pass) {
+      throw new AppError(400, 'PASS_OUTDATED', "QR non più valido: chiedi all'utente di aggiornare l'app e rimostrarlo");
+    }
 
-  const { data: profile, error } = await supabase
-    .from('profiles')
-    .select('id, username, banned, suspended_until')
-    .eq('id', user_id)
-    .maybeSingle();
+    const read = readEntryPass(body.pass);
+    if (read.error === 'expired') {
+      throw new AppError(400, 'PASS_EXPIRED', "QR scaduto: chiedi all'utente di riaprirlo nell'app");
+    }
+    if (read.error) throw new AppError(400, 'PASS_INVALID', 'QR non valido: ingresso negato');
 
-  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Errore database');
-  if (!profile) throw new AppError(404, 'NOT_FOUND', 'Utente non trovato');
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('id, username, avatar_url, banned, suspended_until')
+      .eq('id', read.userId)
+      .maybeSingle();
 
-  if (profile.banned) {
-    throw new AppError(403, 'FORBIDDEN', 'Utente bannato: ingresso negato');
-  }
-  if (profile.suspended_until && new Date(profile.suspended_until) > new Date()) {
-    throw new AppError(403, 'FORBIDDEN', 'Utente in timeout: ingresso negato');
-  }
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Errore database');
+    if (!profile) throw new AppError(404, 'NOT_FOUND', 'Utente non trovato');
 
-  return c.json({ success: true, user: { id: profile.id, username: profile.username } });
-});
+    if (profile.banned) {
+      throw new AppError(403, 'FORBIDDEN', 'Utente bannato: ingresso negato');
+    }
+    if (profile.suspended_until && new Date(profile.suspended_until) > new Date()) {
+      throw new AppError(403, 'FORBIDDEN', 'Utente in timeout: ingresso negato');
+    }
+
+    return c.json({
+      success: true,
+      user: { id: profile.id, username: profile.username, avatar_url: profile.avatar_url ?? null },
+    });
+  },
+);
 export default events;

@@ -221,6 +221,9 @@ const VENUE_AMENITIES = new Set([
   'bar', 'pub', 'biergarten', 'nightclub', 'cafe', 'restaurant', 'fast_food', 'ice_cream', 'food_court',
 ]);
 
+/** Un luogo che la mappa e la ricerca mostrano come locale (POST /bars/resolve). */
+export const isVenueAmenity = (amenity) => VENUE_AMENITIES.has(amenity);
+
 // Photon (komoot) — free, no key, built for as-you-type OSM POI search. Unlike
 // the Nominatim geocoder it handles partial names/typos and isn't 1-req/s
 // rate-limited, so it's the right backend for a live search box.

@@ -5,6 +5,7 @@ import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { isPlus } from '../lib/plus.js';
 import { issueFreeDrinkToken } from '../lib/freeDrink.js';
+import { issueEntryPass } from '../lib/entryPass.js';
 import { assertCleanText } from '../lib/textFilter.js';
 import { assertModerated, identityText } from '../lib/moderation.js';
 import { markUsernameModerated, reviewUsername } from '../lib/usernameReview.js';
@@ -15,6 +16,7 @@ import {
 } from '../schemas/organizerSchemas.js';
 import { assertOwnedPaths, createProofUploadUrls } from '../lib/proofs.js';
 import { eraseAccount } from '../lib/accountDeletion.js';
+import { SSV_ENABLED } from '../lib/admobSsv.js';
 import { mediaUploadSchema, setAvatarSchema } from '../schemas/userSchemas.js';
 import {
   assertMediaUploaded,
@@ -95,24 +97,60 @@ me.patch('/', async (c) => {
   return c.json({ profile: data });
 });
 
-/** POST /me/rewarded — one AdMob rewarded ad watched to the end. Increments the
- *  counter that unlocks the "mar7yyy" theme and returns the new value; the
- *  RPC caps it at 10 (REWARDS_FOR_THEME), so repeated calls plateau.
+/** POST /me/rewarded — one AdMob rewarded ad watched to the end. Returns the
+ *  counter that unlocks the "mar7yyy" theme; the RPC caps it at 10
+ *  (REWARDS_FOR_THEME), so repeated calls plateau.
  *
- *  ponytail: nothing here proves the ad was really watched — that would need
- *  AdMob server-side verification. The reward is a colour palette and the cap
- *  is server-side, so the worst a forged client gets is a theme.
+ *  Without ADMOB_SSV the call itself counts the view: nothing proves the ad was
+ *  watched, and a forged client gets a theme. With ADMOB_SSV=1 only Google's
+ *  signed callback counts (routes/admob.js); this waits a few seconds for it —
+ *  it may land just before or just after the app's call — claims it, and
+ *  answers with the count either way.
  */
 // 20/min e non 5 come le segnalazioni: un rewarded dura mezzo minuto, ma
 // dietro un NAT di rete mobile ci sono molti utenti sullo stesso IP.
+const SSV_WAIT_MS = 8_000;
+const SSV_POLL_MS = 500;
+// A callback older than this belongs to an earlier view, already answered.
+const SSV_CLAIM_WINDOW_MS = 2 * 60 * 1000;
+
 me.post('/rewarded', sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'rewarded' }), async (c) => {
   const user = c.get('user');
 
-  const { data, error } = await supabase.rpc('add_rewarded_view', { p_user: user.id });
-  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not record the reward');
+  if (!SSV_ENABLED) {
+    const { data, error } = await supabase.rpc('add_rewarded_view', { p_user: user.id });
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not record the reward');
+    return c.json({ rewarded_count: data ?? 0 });
+  }
 
-  return c.json({ rewarded_count: data ?? 0 });
+  const since = new Date(Date.now() - SSV_CLAIM_WINDOW_MS).toISOString();
+  const deadline = Date.now() + SSV_WAIT_MS;
+  for (;;) {
+    const { data: claimed, error } = await supabase.rpc('claim_rewarded_ssv', {
+      p_user: user.id,
+      p_since: since,
+    });
+    if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not read the reward');
+    if (claimed || Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, SSV_POLL_MS));
+  }
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('rewarded_count')
+    .eq('id', user.id)
+    .maybeSingle();
+  return c.json({ rewarded_count: profile?.rewarded_count ?? 0 });
 });
+
+/**
+ * GET /me/entry-pass — il pass d'ingresso alle feste da mostrare come QR.
+ * Firmato e a scadenza breve (lib/entryPass.js): l'app lo richiede di nuovo
+ * mentre il QR è a schermo, così uno screenshot smette presto di valere.
+ */
+me.get('/entry-pass', sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'entry-pass' }), (c) =>
+  c.json(issueEntryPass(c.get('user').id)),
+);
 
 /** GET /me/ratings — the caller's own ratings, with the rated bar attached. */
 me.get('/ratings', async (c) => {

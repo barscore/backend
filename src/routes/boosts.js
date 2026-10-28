@@ -22,6 +22,7 @@ import {
   consumeProduct,
   getProduct,
   googlePlayConfigured,
+  playAccountMatches,
   productPaid,
 } from '../lib/googlePlay.js';
 import {
@@ -155,11 +156,11 @@ boosts.post(
   async (c) => {
     await assertMonetizationEnabled();
     const user = c.get('user');
-    const { tier, event_id, bar_id, sponsor_radius_km } = appleOrderSchema.parse(
-      await c.req.json(),
-    );
+    // `sponsor_radius_km` is accepted (older builds send it) but not used: the
+    // radius is priced per km and a fixed-price StoreKit product could only give
+    // it away, as on Google Play. It comes back with per-radius IAP products.
+    const { tier, event_id, bar_id } = appleOrderSchema.parse(await c.req.json());
     const t = TIERS[tier];
-    const radiusKm = bar_id ? sponsor_radius_km ?? null : null;
 
     await assertOwnsTarget(user, { event_id, bar_id, days: t.days });
 
@@ -170,9 +171,8 @@ boosts.post(
         event_id: event_id ?? null,
         bar_id: bar_id ?? null,
         tier,
-        sponsor_radius_km: radiusKm,
-        // Apple charges the fixed StoreKit product price; the radius surcharge is
-        // not billed on iOS yet (real IAP products land with the dev account).
+        sponsor_radius_km: null,
+        // Apple charges the fixed StoreKit product price, nothing else.
         amount_cents: t.amount_cents,
         provider: 'apple',
       })
@@ -226,7 +226,7 @@ boosts.post('/apple/verify', requireAuth, async (c) => {
 
   // The product actually bought has to match the tier the order was opened
   // for, or a 3-day purchase could be redeemed against a 30-day order.
-  if (payload.productId && payload.productId !== APPLE_PRODUCTS[order.tier]) {
+  if (payload.productId !== APPLE_PRODUCTS[order.tier]) {
     throw new AppError(400, 'VALIDATION_ERROR', 'Prodotto non corrispondente all’ordine');
   }
 
@@ -364,7 +364,7 @@ boosts.post(
     // or by another account settles nothing here.
     if (
       (purchase.obfuscatedExternalProfileId && purchase.obfuscatedExternalProfileId !== order.id) ||
-      (purchase.obfuscatedExternalAccountId && purchase.obfuscatedExternalAccountId !== user.id)
+      (purchase.obfuscatedExternalAccountId && !playAccountMatches(purchase.obfuscatedExternalAccountId, user.id))
     ) {
       throw new AppError(400, 'VALIDATION_ERROR', 'Acquisto non corrispondente all’ordine');
     }

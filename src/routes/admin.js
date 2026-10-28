@@ -421,7 +421,10 @@ admin.put('/settings', async (c) => {
   const patch = settingsSchema.parse(await c.req.json());
   const { data, error } = await supabase
     .from('app_settings')
-    .update({ ...patch, updated_at: new Date().toISOString(), updated_by: c.get('user').id })
+    // Niente `updated_by`: la riga si legge con la anon key (manutenzione e beta
+    // sui client) e quel campo pubblicava l'id dell'admin. Chi ha cambiato cosa
+    // lo dice già admin_audit, qui sotto.
+    .update({ ...patch, updated_at: new Date().toISOString() })
     .eq('id', 1)
     .select(SETTINGS_FIELDS)
     .single();

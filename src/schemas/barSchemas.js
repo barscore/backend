@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { httpUrl } from './common.js';
 
 export const nearbyQuerySchema = z.object({
   lat: z.coerce.number().min(-90).max(90).optional(),
@@ -16,9 +17,9 @@ export const createBarSchema = z.object({
   google_place_id: z.string().optional(),
   osm_node_id: z.number().int().optional(),
   phone: z.string().optional(),
-  website: z.string().url().optional(),
+  website: httpUrl().optional(),
   opening_hours: z.record(z.string()).optional(),
-  cover_image_url: z.string().url().optional(),
+  cover_image_url: httpUrl().optional(),
 });
 
 export const updateBarSchema = createBarSchema.partial().extend({
@@ -32,10 +33,10 @@ export const updateBarSchema = createBarSchema.partial().extend({
 // the existing callers (routes/bars.js) keep their import path.
 export { sanitizeHttpUrl } from '../lib/url.js';
 
-// Find-or-create a bar from an OpenStreetMap place. Fields beyond the OSM id
-// are optional hints from the client; anything missing is backfilled from
-// Overpass server-side. `website`/`cover_image_url` are sanitized (not
-// rejected) at insert time via sanitizeHttpUrl.
+// Find-or-create a bar from an OpenStreetMap place. Only the OSM id and the
+// coordinates are used (to find the cached tile): the bar's details always
+// come from our tiles or Overpass (routes/bars.js#trustedPlace). The other
+// fields are still accepted so older app builds that send them don't 400.
 export const resolveBarSchema = z.object({
   osm_node_id: z.coerce.number().int(),
   osm_type: z.enum(['node', 'way', 'relation']).optional().default('node'),

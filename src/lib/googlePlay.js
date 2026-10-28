@@ -1,4 +1,4 @@
-import { createSign } from 'node:crypto';
+import { createHash, createSign } from 'node:crypto';
 
 // Google Play Billing (Android client).
 //
@@ -30,6 +30,22 @@ export const BOOST_PRODUCTS = {
   '7d': 'com.rabar.app.boost.7d',
   '30d': 'com.rabar.app.boost.30d',
 };
+
+/**
+ * What the app stamps on a purchase as `obfuscatedAccountId`: the SHA-256 (hex,
+ * 64 chars, Play's limit) of the rabar user id, as Google recommends — a
+ * one-way value, not the id itself. The Android app computes the same thing
+ * (`BillingManager.accountTag`). Purchases made before the change carry the
+ * bare id: both are accepted, so no existing subscription is lost.
+ */
+export const playAccountTag = (userId) => createHash('sha256').update(userId).digest('hex');
+
+export const playAccountMatches = (tag, userId) =>
+  !!tag && !!userId && (tag === userId || tag === playAccountTag(userId));
+
+/** A bare rabar user id on the purchase: only ever from the app before the hash. */
+export const isLegacyAccountTag = (tag) =>
+  typeof tag === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tag);
 
 const API = 'https://androidpublisher.googleapis.com/androidpublisher/v3/applications';
 const SCOPE = 'https://www.googleapis.com/auth/androidpublisher';
@@ -171,7 +187,7 @@ export function readSubscription(sub, now = new Date()) {
     entitled,
     until: until ? until.toISOString() : null,
     autoRenew: item.autoRenewingPlan?.autoRenewEnabled === true,
-    userId: sub.externalAccountIdentifiers?.obfuscatedExternalAccountId ?? null,
+    accountTag: sub.externalAccountIdentifiers?.obfuscatedExternalAccountId ?? null,
     acknowledged: sub.acknowledgementState === 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED',
     linkedToken: sub.linkedPurchaseToken ?? null,
     orderId: sub.latestOrderId ?? null,
@@ -225,8 +241,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   eq(active.entitled, true, 'active ⇒ entitled');
   eq(active.plan, 'month', 'base plan ⇒ plan');
   eq(active.until, '2026-11-14T12:00:00.000Z', 'expiry ⇒ until');
-  eq(active.userId, 'u1', 'obfuscated account id ⇒ user');
+  eq(active.accountTag, 'u1', 'obfuscated account id ⇒ account tag');
   eq(active.acknowledged, false, 'pending ack');
+
+  const uid = '11111111-1111-4111-8111-111111111111';
+  eq(playAccountTag(uid).length, 64, 'tag fits obfuscatedAccountId');
+  eq(playAccountMatches(playAccountTag(uid), uid), true, 'hashed tag ⇒ owner');
+  eq(playAccountMatches(uid, uid), true, 'legacy bare id ⇒ owner');
+  eq(playAccountMatches(playAccountTag(uid), '22222222-2222-4222-8222-222222222222'), false, 'other user');
+  eq(playAccountMatches(null, uid), false, 'no tag');
+  eq(isLegacyAccountTag(uid), true, 'bare id is legacy');
+  eq(isLegacyAccountTag(playAccountTag(uid)), false, 'hash is not legacy');
 
   eq(readSubscription(sub('SUBSCRIPTION_STATE_CANCELED', '2026-10-20T00:00:00Z'), now).entitled, true, 'cancelled keeps the paid period');
   eq(readSubscription(sub('SUBSCRIPTION_STATE_IN_GRACE_PERIOD', '2026-10-15T00:00:00Z'), now).entitled, true, 'grace period');

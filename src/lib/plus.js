@@ -4,6 +4,8 @@ import {
   PLUS_PRODUCT_ID,
   acknowledgeSubscription,
   getSubscription,
+  isLegacyAccountTag,
+  playAccountMatches,
   readSubscription,
   statusFor,
 } from './googlePlay.js';
@@ -134,7 +136,7 @@ export class PlusOwnershipError extends Error {}
  *
  * Chiamata dall'app subito dopo l'acquisto e a ogni avvio (con `userId`, il
  * chiamante), dalle notifiche in tempo reale di Google e dal cron (senza).
- * L'utente è quello che l'app ha messo sull'acquisto
+ * L'utente è quello che l'app ha messo sull'acquisto, come hash
  * (`obfuscatedAccountId`): un token comprato da un altro account, o già legato
  * a un altro utente, non concede niente a chi lo presenta.
  *
@@ -151,9 +153,29 @@ export async function syncGoogleSubscription(token, { userId } = {}) {
     .eq('google_purchase_token', token)
     .maybeSingle();
 
-  const uid = s.userId ?? bound?.user_id ?? userId ?? null;
+  // Cambio piano: il token nuovo nasce legato al vecchio, che è già nostro.
+  let linked = null;
+  if (!bound && s.linkedToken) {
+    ({ data: linked } = await supabase
+      .from('plus_subscriptions')
+      .select('user_id')
+      .eq('google_purchase_token', s.linkedToken)
+      .maybeSingle());
+  }
+
+  // Sull'acquisto c'è l'hash dell'utente (playAccountTag), o il suo id se è
+  // stato fatto prima dell'hash. Da un hash non si risale a chi è: l'utente
+  // arriva da chi ha già legato il token o dall'app che lo presenta, e l'hash
+  // deve tornare. Una notifica di Google per un token che nessuno ha ancora
+  // presentato aspetta l'app, che lo verifica subito dopo l'acquisto e a ogni avvio.
+  const tag = s.accountTag;
+  const uid = (isLegacyAccountTag(tag) ? tag : null) ?? bound?.user_id ?? linked?.user_id ?? userId ?? null;
   if (!uid) return null;
-  if ((userId && uid !== userId) || (bound && bound.user_id !== uid)) {
+  if (
+    (tag && !playAccountMatches(tag, uid)) ||
+    (userId && uid !== userId) ||
+    (bound && bound.user_id !== uid)
+  ) {
     throw new PlusOwnershipError('Acquisto legato a un altro account');
   }
 

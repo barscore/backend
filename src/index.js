@@ -4,6 +4,7 @@ import { serve } from '@hono/node-server';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { secureHeaders } from 'hono/secure-headers';
+import { bodyLimit } from 'hono/body-limit';
 import { errorHandler, AppError } from './middleware/errorHandler.js';
 import { rateLimiter } from './middleware/rateLimiter.js';
 import { getWriteSwitches } from './lib/appSettings.js';
@@ -28,6 +29,8 @@ import boostRoutes from './routes/boosts.js';
 import plusRoutes from './routes/plus.js';
 import stripeWebhookRoutes from './routes/stripeWebhook.js';
 import googlePlayRoutes from './routes/googlePlay.js';
+import appleNotificationRoutes from './routes/appleNotifications.js';
+import admobRoutes from './routes/admob.js';
 import cronRoutes from './routes/cron.js';
 import authRoutes from './routes/auth.js';
 import statsRoutes from './routes/stats.js';
@@ -81,6 +84,21 @@ app.use(
   }),
 );
 
+// Il corpo più grosso che un client manda è di qualche KB (un evento, un lotto
+// di statistiche, una transazione firmata): oltre la soglia si rifiuta prima di
+// leggerlo. Senza limite arrivava fino ai 4,5 MB di Vercel, e zod 3 valida ogni
+// elemento di un array anche oltre il suo `.max()`: CPU e memoria regalate a
+// chiunque. I webhook dei negozi portano oggetti più grandi e hanno un tetto a
+// parte. Dopo CORS, così il 413 ha gli header e il browser lo legge.
+const tooLarge = (c) =>
+  c.json({ error: 'Richiesta troppo grande', code: 'PAYLOAD_TOO_LARGE', statusCode: 413 }, 413);
+const defaultBodyLimit = bodyLimit({ maxSize: 64 * 1024, onError: tooLarge });
+const webhookBodyLimits = {
+  '/stripe/webhook': bodyLimit({ maxSize: 1024 * 1024, onError: tooLarge }),
+  '/apple/notifications': bodyLimit({ maxSize: 256 * 1024, onError: tooLarge }),
+};
+app.use('*', (c, next) => (webhookBodyLimits[c.req.path] ?? defaultBodyLimit)(c, next));
+
 // CORS non ferma una richiesta "semplice" né un client fuori dal browser: qui
 // /admin/* rifiuta ogni Origin che non sia il pannello. Senza Origin (app
 // native, script) passa e decide requireRole come prima.
@@ -125,6 +143,8 @@ app.use('*', async (c, next) => {
   if (c.req.path === '/stripe/webhook') return next();
   // Google Play's notifications the same (shared token in the URL).
   if (c.req.path === '/google-play/rtdn') return next();
+  // And Apple's (signed JWS): a refund during maintenance must still land.
+  if (c.req.path === '/apple/notifications') return next();
   // Same for the scheduler: it authenticates with CRON_SECRET, has no Bearer
   // token, and beta_mode would otherwise silently stop every reminder.
   if (c.req.path.startsWith('/cron/')) return next();
@@ -177,6 +197,8 @@ app.route('/boosts', boostRoutes);
 app.route('/plus', plusRoutes);
 app.route('/stripe', stripeWebhookRoutes);
 app.route('/google-play', googlePlayRoutes);
+app.route('/apple', appleNotificationRoutes);
+app.route('/admob', admobRoutes);
 app.route('/cron', cronRoutes);
 app.route('/auth', authRoutes);
 app.route('/stats', statsRoutes);

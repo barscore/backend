@@ -18,7 +18,9 @@ import { createClaimSchema } from '../schemas/organizerSchemas.js';
 import { assertOwnedPaths } from '../lib/proofs.js';
 import { assertCleanText } from '../lib/textFilter.js';
 import { assertModerated } from '../lib/moderation.js';
-import { fetchElement, reverseGeocode } from '../lib/osm.js';
+import { fetchElement, isVenueAmenity, reverseGeocode } from '../lib/osm.js';
+import { readTiles } from '../lib/nearbyStore.js';
+import { tileKey, tileOf } from '../lib/nearbyTiles.js';
 import ratings from './ratings.js';
 
 const bars = new Hono();
@@ -79,6 +81,34 @@ bars.get('/:id/drinks', async (c) => {
 });
 
 /**
+ * Il luogo OSM da materializzare, letto solo da fonti nostre: i tasselli
+ * condivisi (gli stessi da cui esce la lista di /places/nearby) e, se lì non
+ * c'è, Overpass. Del corpo della richiesta contano l'id e le coordinate, che
+ * servono solo a trovare il tassello: nome, indirizzo, telefono e sito del
+ * client non si salvano. Prima sì, e su una rotta anonima voleva dire poter
+ * dare a un bar vero, prima che qualcuno lo aprisse, un sito di phishing o un
+ * telefono finto, o creare bar inesistenti con id inventati.
+ */
+async function trustedPlace({ osm_node_id, osm_type, lat, lng }) {
+  const id = String(osm_node_id);
+  if (lat != null && lng != null) {
+    // Anche i tasselli accanto: le coordinate sono un indizio del client, e un
+    // locale sul bordo può cadere in quello vicino.
+    const { tx, ty } = tileOf(lat, lng);
+    const keys = [];
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) keys.push(tileKey(tx + dx, ty + dy));
+    for (const { places } of (await readTiles(keys)).values()) {
+      const hit = places.find((p) => String(p.osm_node_id) === id);
+      if (hit) return hit;
+    }
+  }
+  const el = await fetchElement(osm_type, osm_node_id);
+  // Un id qualsiasi di OSM non è un locale: chiesa, fermata o casa non
+  // diventano un bar votabile.
+  return el && isVenueAmenity(el.amenity) ? el : null;
+}
+
+/**
  * POST /bars/resolve — find-or-create a bar from an OpenStreetMap place.
  * Bars shown on the map come straight from Overpass and may not be persisted
  * yet; the first time anyone opens/rates one, we materialize it here (keyed by
@@ -99,13 +129,14 @@ bars.post('/resolve', sharedRateLimiter({ windowMs: 60_000, max: 30, key: 'bar-r
   if (findErr) throw new AppError(500, 'INTERNAL_ERROR', 'Could not resolve bar');
   if (existing) return c.json({ bar: existing });
 
-  // Backfill any missing fields from Overpass when the client only sent an id.
-  let info = body;
-  if (!body.name || body.lat == null || body.lng == null) {
-    const el = await fetchElement(body.osm_type, body.osm_node_id);
-    if (!el) throw new AppError(404, 'NOT_FOUND', 'OSM place not found');
-    info = { ...el, ...Object.fromEntries(Object.entries(body).filter(([, v]) => v != null)) };
+  let info;
+  try {
+    info = await trustedPlace(body);
+  } catch (e) {
+    console.error('[bars] resolve: Overpass non raggiungibile:', e.message);
+    throw new AppError(502, 'UPSTREAM_ERROR', 'OpenStreetMap non raggiungibile, riprova');
   }
+  if (!info) throw new AppError(404, 'NOT_FOUND', 'OSM place not found');
   if (info.lat == null || info.lng == null)
     throw new AppError(422, 'VALIDATION_ERROR', 'Missing coordinates for bar');
 

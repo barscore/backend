@@ -88,3 +88,29 @@ export async function verifySignedTransaction(signedTransaction) {
   }
   return null;
 }
+
+/**
+ * Verifies an App Store Server Notification V2 and the transaction it carries.
+ *
+ * Same verifiers, same rule as verifySignedTransaction: a sandbox notification
+ * is believed only where ALLOW_SANDBOX says one can legitimately arrive. The
+ * transaction is checked by the verifier that accepted the notification — both
+ * are signed for the same environment. Returns `{ notification, transaction }`
+ * (`transaction` null for types without one, like TEST), or null when nothing
+ * verifies.
+ */
+export async function verifyNotification(signedPayload) {
+  const available = loadVerifiers();
+
+  for (const verifier of available) {
+    try {
+      const notification = await verifier.verifyAndDecodeNotification(signedPayload);
+      const signed = notification.data?.signedTransactionInfo;
+      const transaction = signed ? await verifier.verifyAndDecodeTransaction(signed) : null;
+      return { notification, transaction };
+    } catch {
+      // Wrong environment for this verifier — try the next one.
+    }
+  }
+  return null;
+}

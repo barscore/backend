@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { httpUrl } from './common.js';
 
 // Reuse the same coercing lat/lng/radius query shape as bars.
 export const nearbyEventsQuerySchema = z.object({
@@ -19,7 +20,7 @@ export const createEventSchema = z
     starts_at: z.string().datetime({ offset: true }),
     ends_at: z.string().datetime({ offset: true }).optional(),
     has_presales: z.boolean().optional().default(false),
-    photo_url: z.string().url().max(1000).optional().nullable(),
+    photo_url: httpUrl(1000).optional().nullable(),
     free_drink: z.boolean().optional().default(false),
   })
   .refine((e) => e.bar_id || (e.lat != null && e.lng != null), {
@@ -39,7 +40,7 @@ export const updateEventSchema = z
     starts_at: z.string().datetime({ offset: true }).optional(),
     ends_at: z.string().datetime({ offset: true }).optional().nullable(),
     has_presales: z.boolean().optional(),
-    photo_url: z.string().url().max(1000).optional().nullable(),
+    photo_url: httpUrl(1000).optional().nullable(),
     free_drink: z.boolean().optional(),
   })
   .refine((e) => Object.keys(e).length > 0, { message: 'Empty update' });
