@@ -6,7 +6,7 @@ import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { isPlus } from '../lib/plus.js';
 import { issueFreeDrinkToken } from '../lib/freeDrink.js';
 import { issueEntryPass } from '../lib/entryPass.js';
-import { assertCleanText } from '../lib/textFilter.js';
+import { assertCleanText, isReservedUsername } from '../lib/textFilter.js';
 import { assertModerated, identityText } from '../lib/moderation.js';
 import { markUsernameModerated, reviewUsername } from '../lib/usernameReview.js';
 import { myDrinkVotesQuerySchema } from '../schemas/drinkSchemas.js';
@@ -72,6 +72,9 @@ me.patch('/', async (c) => {
   const user = c.get('user');
   const { updateProfileSchema } = await import('../schemas/userSchemas.js');
   const body = updateProfileSchema.parse(await c.req.json());
+  if (body.username && isReservedUsername(body.username)) {
+    throw new AppError(409, 'CONFLICT', 'Questo username non è disponibile');
+  }
   // Username e handle Instagram compaiono accanto a ogni contenuto pubblico.
   assertCleanText(body.username, body.instagram_username);
   const checked = await assertModerated(

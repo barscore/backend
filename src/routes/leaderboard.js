@@ -2,8 +2,8 @@ import { Hono } from 'hono';
 import { supabase } from '../lib/supabase.js';
 import { AppError } from '../middleware/errorHandler.js';
 
-// Public ice-cube leaderboard: every user ranked by accumulated ice cubes
-// (10 per rating). Aggregation lives in the get_leaderboard Postgres RPC — never
+// Public ice-cube leaderboard: every user except the `demo_` store accounts,
+// ranked by accumulated ice cubes (10 per rating). Aggregation lives in the get_leaderboard Postgres RPC — never
 // computed in JS — so it stays in sync with the ratings table.
 const leaderboard = new Hono();
 

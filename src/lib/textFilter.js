@@ -112,6 +112,14 @@ export function assertCleanText(...texts) {
   }
 }
 
+/**
+ * `demo_` è riservato agli account demo degli store, che get_leaderboard nasconde.
+ * Si pulisce come in handle_new_user: spazi e caratteri invisibili non lo aggirano.
+ */
+export function isReservedUsername(username) {
+  return /^demo_/i.test(username.normalize('NFKC').replace(/[^a-zA-Z0-9_]/g, ''));
+}
+
 // --- self-check: `node src/lib/textFilter.js`
 if (import.meta.url === `file://${process.argv[1]}`) {
   const eq = (a, b, m) => {
@@ -145,6 +153,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   eq(thrown?.statusCode, 422, 'assertCleanText rifiuta');
   eq(thrown?.code, 'CONTENT_REJECTED', 'con il suo codice');
   assertCleanText(undefined, null, 'Ottimo spritz');
+
+  eq(isReservedUsername('demo_luca'), true, 'prefisso riservato');
+  eq(isReservedUsername('DeMo_luca'), true, 'maiuscole');
+  eq(isReservedUsername(' demo_luca'), true, 'spazio davanti');
+  eq(isReservedUsername('​demo_luca'), true, 'carattere invisibile');
+  eq(isReservedUsername('ｄｅｍｏ＿luca'), true, 'caratteri fullwidth');
+  eq(isReservedUsername('demolition_man'), false, 'altri nomi passano');
+  eq(isReservedUsername('mydemo_luca'), false, 'solo come prefisso');
 
   console.log('textFilter self-check ok');
 }
