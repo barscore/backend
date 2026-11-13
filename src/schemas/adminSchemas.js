@@ -62,7 +62,7 @@ export const listRatingsQuerySchema = z.object({
 });
 
 export const listAuditQuerySchema = z.object({
-  actor_id: z.string().uuid().optional(),
+  actor_id: z.guid().optional(),
   action: z.string().trim().max(60).optional(),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(50),

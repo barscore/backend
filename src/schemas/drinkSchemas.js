@@ -18,13 +18,13 @@ export const listTopQuerySchema = z.object({
 
 // GET /me/drink-votes filter (prefill "your vote" in the UI).
 export const myDrinkVotesQuerySchema = z.object({
-  drink_id: z.string().uuid().optional(),
-  bar_id: z.string().uuid().optional(),
+  drink_id: z.guid().optional(),
+  bar_id: z.guid().optional(),
 });
 
 // Single 1-5 vote for a drink at a bar (upserted on the unique key).
 export const createDrinkVoteSchema = z.object({
-  bar_id: z.string().uuid(),
+  bar_id: z.guid(),
   rating: z.number().int().min(1).max(5),
 });
 

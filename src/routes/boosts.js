@@ -192,7 +192,7 @@ boosts.post(
  * retries, `Transaction.updates` on a second device) therefore lands on an
  * already-paid row and returns it unchanged rather than granting a second boost.
  */
-boosts.post('/apple/verify', requireAuth, async (c) => {
+boosts.post('/apple/verify', requireAuth, sharedRateLimiter({ windowMs: 60_000, max: 20, key: 'boost-apple' }), async (c) => {
   const user = c.get('user');
   const { signed_transaction } = appleVerifySchema.parse(await c.req.json());
 
@@ -210,10 +210,14 @@ boosts.post('/apple/verify', requireAuth, async (c) => {
   // Already recorded: hand back the same order instead of paying it twice.
   const { data: seen } = await supabase
     .from('boost_orders')
-    .select('id, status, tier, event_id, bar_id, paid_at')
+    .select('id, status, tier, event_id, bar_id, paid_at, user_id')
     .eq('apple_transaction_id', transactionId)
     .maybeSingle();
-  if (seen) return c.json({ order: seen });
+  if (seen) {
+    if (seen.user_id !== user.id) throw new AppError(404, 'NOT_FOUND', 'Ordine non trovato');
+    const { user_id: _owner, ...order } = seen;
+    return c.json({ order });
+  }
 
   const { data: order } = await supabase
     .from('boost_orders')

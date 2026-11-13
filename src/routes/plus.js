@@ -52,7 +52,10 @@ plus.get('/status', requireAuth, async (c) => {
 });
 
 /** POST /plus/checkout — apre la Stripe Checkout Session in modalità abbonamento. */
-plus.post('/checkout', requireAuth, async (c) => {
+// Ogni chiamata apre una sessione su Stripe: senza limite un account solo ne crea a migliaia.
+const stripeLimit = sharedRateLimiter({ windowMs: 60_000, max: 10, key: 'plus-stripe' });
+
+plus.post('/checkout', requireAuth, stripeLimit, async (c) => {
   if (!stripe) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
   await assertMonetizationEnabled();
   const user = c.get('user');
@@ -126,7 +129,7 @@ plus.post('/checkout', requireAuth, async (c) => {
 });
 
 /** POST /plus/portal — portale Stripe per cambiare piano o disdire. */
-plus.post('/portal', requireAuth, async (c) => {
+plus.post('/portal', requireAuth, stripeLimit, async (c) => {
   if (!stripe) throw new AppError(503, 'UNAVAILABLE', 'Pagamenti non configurati');
   const user = c.get('user');
 

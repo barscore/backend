@@ -262,7 +262,7 @@ me.delete('/avatar', async (c) => {
 
 me.post('/promo', async (c) => {
   const user = c.get('user');
-  const { promo } = await c.req.json();
+  const { promo } = (await c.req.json().catch(() => null)) ?? {};
   if (promo !== 'explorer') return c.json({ success: true });
 
   // The profile row is created by the handle_new_user trigger after signUp.

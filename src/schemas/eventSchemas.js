@@ -12,7 +12,7 @@ export const nearbyEventsQuerySchema = z.object({
 // backfills lat/lng from that bar; a standalone event may pass its own coords.
 export const createEventSchema = z
   .object({
-    bar_id: z.string().uuid().optional(),
+    bar_id: z.guid().optional(),
     title: z.string().min(2).max(120),
     description: z.string().max(1000).optional(),
     lat: z.number().min(-90).max(90).optional(),

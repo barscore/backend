@@ -9,8 +9,8 @@ const oneTargetMessage = { message: 'Serve esattamente uno tra event_id e bar_id
 const targetSchema = z
   .object({
     tier,
-    event_id: z.string().uuid().optional(),
-    bar_id: z.string().uuid().optional(),
+    event_id: z.guid().optional(),
+    bar_id: z.guid().optional(),
     // Visibility radius (km) for a bar boost, chosen on the checkout slider.
     // Meaningless for events, so it's rejected unless bar_id is set.
     sponsor_radius_km: z.number().int().min(1).max(50).nullish(),
@@ -44,14 +44,14 @@ export const appleVerifySchema = z.object({
 export const googleOrderSchema = z
   .object({
     tier,
-    event_id: z.string().uuid().optional(),
-    bar_id: z.string().uuid().optional(),
+    event_id: z.guid().optional(),
+    bar_id: z.guid().optional(),
   })
   .refine(oneTarget, oneTargetMessage);
 
 /** POST /boosts/google/verify — what Google Play handed the app. */
 export const googleVerifySchema = z.object({
-  order_id: z.string().uuid(),
+  order_id: z.guid(),
   product_id: z.string().min(1).max(100),
   purchase_token: z.string().min(10).max(4096),
 });

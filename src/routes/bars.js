@@ -310,7 +310,7 @@ bars.post(
   async (c) => {
     const user = c.get('user');
     const { token, bar_id } = z
-      .object({ token: z.string().uuid(), bar_id: z.string().uuid() })
+      .object({ token: z.guid(), bar_id: z.guid() })
       .parse(await c.req.json());
 
     const { data: status, error } = await supabase.rpc('redeem_free_drink', {
@@ -339,7 +339,7 @@ bars.patch(
     const user = c.get('user');
     const body = z.object({
       accepts_free_drinks: z.boolean(),
-      free_drinks_hours: z.string().nullable().optional()
+      free_drinks_hours: z.string().max(200).nullable().optional()
     }).parse(await c.req.json());
     assertCleanText(body.free_drinks_hours);
 

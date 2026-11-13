@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { audit } from '../lib/audit.js';
+import { getWriteSwitches } from '../lib/appSettings.js';
 import { isPlus } from '../lib/plus.js';
 import { notify } from '../lib/notify.js';
 import { assertCleanText } from '../lib/textFilter.js';
@@ -26,11 +27,9 @@ async function assertBarExists(barId) {
 // Admin security switch: block new/updated ratings when disabled from the panel.
 // Exported: drink votes (routes/drinks.js) respect the same kill switch.
 export async function assertRatingsEnabled() {
-  const { data } = await supabase
-    .from('app_settings')
-    .select('ratings_enabled')
-    .eq('id', 1)
-    .maybeSingle();
+  // Stessa riga, già in memoria per il gate delle scritture (lib/appSettings.js):
+  // un voto non paga un secondo round-trip per rileggerla.
+  const data = await getWriteSwitches();
   if (data && data.ratings_enabled === false) {
     throw new AppError(503, 'RATINGS_DISABLED', 'Le valutazioni sono temporaneamente disabilitate');
   }

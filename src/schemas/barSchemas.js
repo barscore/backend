@@ -18,14 +18,17 @@ export const createBarSchema = z.object({
   osm_node_id: z.number().int().optional(),
   phone: z.string().optional(),
   website: httpUrl().optional(),
-  opening_hours: z.record(z.string()).optional(),
+  opening_hours: z.record(z.string(), z.string()).optional(),
   cover_image_url: httpUrl().optional(),
 });
 
 export const updateBarSchema = createBarSchema.partial().extend({
+  // Senza default: in zod 4 `.partial()` lo applicherebbe a ogni modifica,
+  // riportando a 'IT' il paese di un bar che non lo manda.
+  country: z.string().length(2).optional(),
   is_active: z.boolean().optional(),
   accepts_free_drinks: z.boolean().optional(),
-  free_drinks_hours: z.string().nullable().optional(),
+  free_drinks_hours: z.string().max(200).nullable().optional(),
 });
 
 // Lives in lib/url.js now — lib/osm.js sanitizes the raw OSM tags too, and a

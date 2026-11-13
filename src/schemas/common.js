@@ -1,7 +1,10 @@
 import { z } from 'zod';
 import { sanitizeHttpUrl } from '../lib/url.js';
 
-const uuidSchema = z.string().uuid();
+// z.guid(): la forma 8-4-4-4-12 e basta, com'era `.uuid()` in zod 3. In zod 4
+// `.uuid()` controlla anche versione e variante RFC e rifiuterebbe id validi
+// per Postgres. Vale per tutti gli schemi.
+const uuidSchema = z.guid();
 
 // Every entity PK in the schema is a UUID, so any :id/:rid/:barId path param
 // must parse as one. Parsing here turns a malformed id into a clean 400

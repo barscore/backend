@@ -16,7 +16,7 @@ const SOURCES_BY_KIND = {
 const eventSchema = z
   .object({
     // Assente solo per signup, che non riguarda un bar.
-    bar_id: z.string().uuid().optional(),
+    bar_id: z.guid().optional(),
     kind: z.enum(['scan', 'view', 'directions', 'call', 'website', 'review', 'signup']),
     source: z.enum(['qr', 'nfc', 'map', 'list', 'search', 'link']).optional(),
   })
@@ -32,7 +32,7 @@ const eventSchema = z
 export const statsEventsSchema = z.object({
   // UUID casuale generato dal client e tenuto in locale: identifica il
   // dispositivo, non la persona, e non viene mai legato a un account.
-  visitor_id: z.string().uuid(),
+  visitor_id: z.guid(),
   events: z.array(eventSchema).min(1).max(20),
 });
 

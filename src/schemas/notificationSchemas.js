@@ -9,7 +9,7 @@ export const listNotificationsQuerySchema = z.object({
 // { all: true } marks everything read; { ids } marks a specific batch.
 export const markReadSchema = z.union([
   z.object({ all: z.literal(true) }),
-  z.object({ ids: z.array(z.string().uuid()).min(1).max(100) }),
+  z.object({ ids: z.array(z.guid()).min(1).max(100) }),
 ]);
 
 export const pushSubscribeSchema = z.object({
