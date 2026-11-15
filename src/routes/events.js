@@ -7,6 +7,8 @@ import { z } from 'zod';
 import { AppError } from '../middleware/errorHandler.js';
 import { sharedRateLimiter } from '../middleware/rateLimiter.js';
 import { notify } from '../lib/notify.js';
+import { haversineKm } from '../lib/osm.js';
+import { sortPrs } from '../lib/prSort.js';
 import { readEntryPass } from '../lib/entryPass.js';
 import { assertCleanText } from '../lib/textFilter.js';
 import { assertModerated } from '../lib/moderation.js';
@@ -15,6 +17,8 @@ import {
   nearbyEventsQuerySchema,
   createEventSchema,
   updateEventSchema,
+  prsQuerySchema,
+  prPresalesSchema,
 } from '../schemas/eventSchemas.js';
 
 const events = new Hono();
@@ -114,6 +118,17 @@ events.get('/:id', async (c) => {
   return c.json({ event });
 });
 
+/** The columns a PR may set on their own row; the zone rounded to ~1 km. */
+function prDeclared({ presales_available, lat, lng }) {
+  const out = {};
+  if (presales_available !== undefined) out.presales_available = presales_available;
+  if (lat != null && lng != null) {
+    out.lat = Math.round(lat * 100) / 100;
+    out.lng = Math.round(lng * 100) / 100;
+  }
+  return out;
+}
+
 /**
  * GET /events/:id/prs — PR approvati dal creatore dell'evento. Il creatore
  * vede anche le candidature in attesa, il PR vede la propria.
@@ -121,12 +136,13 @@ events.get('/:id', async (c) => {
 events.get('/:id/prs', async (c) => {
   const id = uuidParam(c);
   const uid = await optionalUser(c);
+  const here = prsQuerySchema.parse(Object.fromEntries(new URL(c.req.url).searchParams));
 
   const [{ data: ev }, { data, error }] = await Promise.all([
     supabase.from('events').select('created_by').eq('id', id).maybeSingle(),
     supabase
       .from('event_prs')
-      .select('pr_id, approved_at, profiles!event_prs_pr_id_fkey(username, avatar_url, instagram_username, whatsapp_number)')
+      .select('pr_id, approved_at, presales_available, lat, lng, profiles!event_prs_pr_id_fkey(username, avatar_url, instagram_username, whatsapp_number)')
       .eq('event_id', id),
   ]);
 
@@ -142,8 +158,14 @@ events.get('/:id/prs', async (c) => {
       avatar_url: row.profiles?.avatar_url,
       instagram_username: row.profiles?.instagram_username,
       whatsapp_number: row.profiles?.whatsapp_number,
+      presales_available: row.presales_available,
+      // The PR's zone never leaves the server: only how far it is, to the km.
+      distance_km:
+        here.lat != null && here.lng != null && row.lat != null && row.lng != null
+          ? Math.round(haversineKm(here.lat, here.lng, row.lat, row.lng))
+          : null,
     }));
-  return c.json({ prs });
+  return c.json({ prs: sortPrs(prs) });
 });
 
 /**
@@ -277,6 +299,8 @@ events.put('/:id', requireAuth, requireRole('organizer', 'admin', 'moderator'), 
 events.post('/:id/join', requireAuth, requireRole('organizer'), async (c) => {
   const id = uuidParam(c);
   const user = c.get('user');
+  // No body from the clients that predate the presale count.
+  const declared = prDeclared(prPresalesSchema.parse(await c.req.json().catch(() => ({}))));
 
   const [{ data: me }, { data: ev }] = await Promise.all([
     supabase.from('profiles').select('organizer_type, username').eq('id', user.id).maybeSingle(),
@@ -291,7 +315,7 @@ events.post('/:id/join', requireAuth, requireRole('organizer'), async (c) => {
   const ownEvent = ev.created_by === user.id;
   const { error } = await supabase
     .from('event_prs')
-    .insert({ event_id: id, pr_id: user.id, approved_at: ownEvent ? new Date().toISOString() : null });
+    .insert({ event_id: id, pr_id: user.id, approved_at: ownEvent ? new Date().toISOString() : null, ...declared });
 
   if (error?.code === '23505') {
     const { data: row } = await supabase
@@ -372,6 +396,25 @@ events.delete('/:id/prs/:prId', requireAuth, async (c) => {
     await audit(user.id, 'event.pr_remove', { targetType: 'event', targetId: ev.id, payload: { pr_id: prId } });
   }
   return c.json({ success: true });
+});
+
+/** PATCH /events/:id/join — the PR updates how many presales are left (and the zone). */
+events.patch('/:id/join', requireAuth, requireRole('organizer'), async (c) => {
+  const id = uuidParam(c);
+  const user = c.get('user');
+  const declared = prDeclared(prPresalesSchema.parse(await c.req.json()));
+  if (!Object.keys(declared).length) throw new AppError(400, 'VALIDATION_ERROR', 'Nothing to update');
+
+  const { data, error } = await supabase
+    .from('event_prs')
+    .update(declared)
+    .eq('event_id', id)
+    .eq('pr_id', user.id)
+    .select('presales_available')
+    .maybeSingle();
+  if (error) throw new AppError(500, 'INTERNAL_ERROR', 'Could not update presales');
+  if (!data) throw new AppError(404, 'NOT_FOUND', 'Non sei PR di questo evento');
+  return c.json({ success: true, presales_available: data.presales_available });
 });
 
 /** DELETE /events/:id/join — PR leaves an event. */

@@ -29,11 +29,15 @@ const OVERPASS_TIMEOUT_MS = Number(process.env.OVERPASS_TIMEOUT_MS) || 20000;
 // Fire the query at every mirror simultaneously; resolve with the first 200.
 // Each attempt aborts on timeout; losers are aborted once a winner is found so
 // no hung connection (a sick mirror can sit there for 100s+) leaks. Overpass
-// accepts the raw query as the POST body.
-async function overpassFetch(query, timeoutMs = OVERPASS_TIMEOUT_MS) {
+// accepts the raw query as the POST body. `signal` (optional) cancels all of
+// them: the caller no longer wants the answer.
+async function overpassFetch(query, timeoutMs = OVERPASS_TIMEOUT_MS, signal) {
   const controllers = OVERPASS_URLS.map(() => new AbortController());
   const timers = [];
+  const cancel = () => controllers.forEach((c) => c.abort());
+  signal?.addEventListener('abort', cancel, { once: true });
   try {
+    if (signal?.aborted) throw new Error('cancelled');
     const attempts = OVERPASS_URLS.map((url, i) => {
       const ctrl = controllers[i];
       timers.push(setTimeout(() => ctrl.abort(), timeoutMs));
@@ -67,7 +71,8 @@ async function overpassFetch(query, timeoutMs = OVERPASS_TIMEOUT_MS) {
     const msg = e.errors?.map((x) => x.message).join('; ') || e.message;
     throw new Error(`Overpass unreachable: ${msg}`);
   } finally {
-    controllers.forEach((c) => c.abort()); // cancel stragglers
+    cancel(); // stragglers
+    signal?.removeEventListener('abort', cancel);
     timers.forEach(clearTimeout);
   }
 }
@@ -138,7 +143,7 @@ export const NEARBY_AMENITIES = ['bar', 'pub', 'biergarten', 'nightclub', 'cafe'
  * normalized POIs (not persisted). The box is what routes/places.js asks for:
  * the tiles it has no data for.
  */
-export async function findBarsInBox({ s, w, n, e }) {
+export async function findBarsInBox({ s, w, n, e }, signal) {
   const midLat = ((s + n) / 2) * (Math.PI / 180);
   const halfSpanKm = (Math.max(n - s, (e - w) * Math.cos(midLat)) * 111) / 2;
   // Scale the Overpass server-side timeout AND our client abort with the area.
@@ -170,10 +175,11 @@ export async function findBarsInBox({ s, w, n, e }) {
   // cloud IPs); a second pass a moment later usually finds a healthy one.
   let data;
   try {
-    data = await overpassFetch(query, (serverTimeout + 15) * 1000);
-  } catch {
+    data = await overpassFetch(query, (serverTimeout + 15) * 1000, signal);
+  } catch (err) {
+    if (signal?.aborted) throw err;
     await new Promise((r) => setTimeout(r, 1500));
-    data = await overpassFetch(query, (serverTimeout + 15) * 1000);
+    data = await overpassFetch(query, (serverTimeout + 15) * 1000, signal);
   }
   // A query that ran out of time or memory on the mirror still comes back 200,
   // with whatever it had found so far and the reason in `remark`. Saved as a

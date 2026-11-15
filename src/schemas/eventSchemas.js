@@ -8,6 +8,20 @@ export const nearbyEventsQuerySchema = z.object({
   radius_km: z.coerce.number().positive().max(100).optional().default(2),
 });
 
+// Where the viewer is, to put the nearest PR first (GET /events/:id/prs).
+export const prsQuerySchema = z.object({
+  lat: z.coerce.number().min(-90).max(90).optional(),
+  lng: z.coerce.number().min(-180).max(180).optional(),
+});
+
+// What a PR declares for an event (POST and PATCH /events/:id/join). All
+// optional: older clients join with no body. `null` clears the count.
+export const prPresalesSchema = z.object({
+  presales_available: z.number().int().min(0).max(10000).nullable().optional(),
+  lat: z.number().min(-90).max(90).optional(),
+  lng: z.number().min(-180).max(180).optional(),
+});
+
 // Events are added by hand for a venue. `bar_id` ties the event to a locale and
 // backfills lat/lng from that bar; a standalone event may pass its own coords.
 export const createEventSchema = z

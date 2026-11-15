@@ -479,7 +479,7 @@ me.get('/export', sharedRateLimiter({ windowMs: 3600_000, max: 5, key: 'export' 
         'events',
         'id, bar_id, title, description, lat, lng, starts_at, ends_at, cancelled_at, has_presales, photo_url, free_drink, created_at',
       ).order('created_at', { ascending: false }),
-      supabase.from('event_prs').select('event_id, approved_at, created_at').eq('pr_id', user.id),
+      supabase.from('event_prs').select('event_id, approved_at, created_at, presales_available, lat, lng').eq('pr_id', user.id),
       // Le risposte del gestore stanno sulle recensioni degli altri: si trovano
       // dal bar che possiede, e se ne esporta solo il testo suo.
       supabase

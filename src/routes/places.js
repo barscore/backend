@@ -54,7 +54,7 @@ const CACHE_FILE = resolve(
 );
 
 const tileCache = new Map(); // tile key -> { at, places }
-const inflight = new Map(); // box id -> Promise<Map(tile key -> places) | null>
+const inflight = new Map(); // box id -> { promise, ctrl, waiters, keep }
 const TIMEOUT = Symbol('timeout');
 
 function loadCacheFromDisk() {
@@ -136,30 +136,45 @@ async function loadTiles(tiles) {
  * with `Map(tile key → places)`, or null when another instance holds the claim
  * on the same box: its result will show up in the shared table. Requests on
  * this instance asking for the same box share the one query.
+ *
+ * `signal` is the caller's request: when every request waiting on the query
+ * has gone away (the user moved the map on), the query is cancelled, so it does
+ * not hold one of the few slots a mirror gives our IP while the next one waits.
+ * A caller without a signal, or `job.keep = true`, keeps it running to the end.
  */
-function fetchTiles(tiles) {
+function fetchTiles(tiles, signal) {
   const box = tilesBox(tiles);
   const id = `${TILE_VERSION}:${box.s},${box.w},${box.n},${box.e}`;
   let job = inflight.get(id);
-  if (job) return job;
-  job = (async () => {
-    if (!(await claimFetch(id, FETCH_LOCK_MS))) return null;
-    try {
-      const byTile = splitByTile(await findBarsInBox(box), box);
-      const at = Date.now();
-      for (const [key, list] of byTile) cacheSet(key, list, at);
-      // Awaited, not fired and forgotten: a serverless instance can be frozen
-      // the moment the response is out, and this write is what spares the next
-      // instance the wait.
-      await writeTiles(byTile, at);
-      return byTile;
-    } finally {
-      // Failed or done, the box is free: a failure is often a burst of
-      // refusals from the mirrors, and the clients' next try may get through.
-      await releaseFetch(id).catch(() => {});
-    }
-  })().finally(() => inflight.delete(id));
-  inflight.set(id, job);
+  if (!job) {
+    const ctrl = new AbortController();
+    job = { ctrl, waiters: 0, keep: false };
+    job.promise = (async () => {
+      if (!(await claimFetch(id, FETCH_LOCK_MS))) return null;
+      try {
+        const byTile = splitByTile(await findBarsInBox(box, ctrl.signal), box);
+        const at = Date.now();
+        for (const [key, list] of byTile) cacheSet(key, list, at);
+        // Awaited, not fired and forgotten: a serverless instance can be frozen
+        // the moment the response is out, and this write is what spares the next
+        // instance the wait.
+        await writeTiles(byTile, at);
+        return byTile;
+      } finally {
+        // Failed or done, the box is free: a failure is often a burst of
+        // refusals from the mirrors, and the clients' next try may get through.
+        await releaseFetch(id).catch(() => {});
+      }
+    })().finally(() => inflight.delete(id));
+    inflight.set(id, job);
+  }
+  if (!signal) job.keep = true;
+  else if (!signal.aborted) {
+    job.waiters++;
+    signal.addEventListener('abort', () => {
+      if (--job.waiters === 0 && !job.keep) job.ctrl.abort();
+    }, { once: true });
+  }
   return job;
 }
 
@@ -186,11 +201,15 @@ async function waitForShared(tiles, deadline) {
  * On TIMEOUT our own query, if any, keeps going and fills the cache for the
  * client's next try. Throws when Overpass failed.
  */
-async function loadMissing(tiles, deadline) {
-  const job = fetchTiles(tiles);
-  let loaded = await until(job, deadline);
+async function loadMissing(tiles, deadline, signal) {
+  const job = fetchTiles(tiles, signal);
+  let loaded = await until(job.promise, deadline);
   if (loaded === null) loaded = await waitForShared(tiles, deadline);
-  if (loaded === TIMEOUT) keepAlive(job);
+  if (loaded === TIMEOUT) {
+    // Answered `stale`: the client comes back for this very box.
+    job.keep = true;
+    keepAlive(job.promise);
+  }
   return loaded;
 }
 
@@ -205,7 +224,7 @@ async function refreshTiles(tiles) {
     if (entry.at > (tileCache.get(key)?.at ?? 0)) cacheSet(key, entry.places, entry.at);
   }
   const old = tiles.filter((t) => !(shared.get(t.key)?.at > fresh));
-  if (old.length) await fetchTiles(old);
+  if (old.length) await fetchTiles(old).promise;
 }
 
 /** The places of `tiles` inside the circle, one per OSM element. */
@@ -456,7 +475,7 @@ places.get('/nearby', async (c) => {
       ? tilesAround(lat, lng, PREFETCH_KM).filter((t) => !entries.has(t.key))
       : missing;
     try {
-      const loaded = await loadMissing(load, Date.now() + COLD_WAIT_MS);
+      const loaded = await loadMissing(load, Date.now() + COLD_WAIT_MS, c.req.raw.signal);
       if (loaded === TIMEOUT) stale = true;
       else for (const [key, list] of loaded) entries.set(key, { at: Date.now(), places: list });
     } catch (e) {
